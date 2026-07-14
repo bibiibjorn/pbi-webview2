@@ -47,11 +47,22 @@ async function poll(probe, predicate, timeoutMs, intervalMs = 1000) {
     }
     return intervalMs;
   })();
+  // A probe hitting a busy renderer rejects with "renderer-busy" (see
+  // budgetedPage). Inside a poll that just means "not ready yet" — swallow it
+  // and keep looping until the caller's timeout.
+  const tryProbe = async () => {
+    try {
+      return await probe();
+    } catch (e) {
+      if (/renderer-busy/.test(String((e && e.message) || e))) return undefined;
+      throw e;
+    }
+  };
   await new Promise((r) => setTimeout(r, 500));
-  let value = await probe();
+  let value = await tryProbe();
   while (!predicate(value) && Date.now() - start < timeoutMs) {
     await new Promise((r) => setTimeout(r, effectiveInterval));
-    value = await probe();
+    value = await tryProbe();
   }
   return { value, elapsedMs: Date.now() - start, satisfied: predicate(value) };
 }

@@ -96,6 +96,44 @@ async function connect() {
 }
 
 /**
+ * Budget every page.evaluate: an evaluate queues BEHIND the renderer's main
+ * thread, so a "cheap" read against a canvas that is mid-render blocks for the
+ * whole render (observed: minutes). Convert that into a fast structured
+ * "renderer-busy" error instead. Override via PBI_EVAL_BUDGET_MS.
+ */
+const EVAL_BUDGET_MS = (() => {
+  const v = parseInt(process.env.PBI_EVAL_BUDGET_MS || '', 10);
+  return Number.isNaN(v) ? 10000 : v;
+})();
+
+function budgetedPage(page) {
+  return new Proxy(page, {
+    get(target, prop) {
+      if (prop === 'evaluate') {
+        return (fn, arg) => {
+          let t;
+          const timeout = new Promise((_, reject) => {
+            t = setTimeout(
+              () =>
+                reject(
+                  new Error(
+                    `renderer-busy: the report canvas did not yield within ${EVAL_BUDGET_MS}ms ` +
+                      '(page switch or visual queries in flight); retry in a few seconds'
+                  )
+                ),
+              EVAL_BUDGET_MS
+            );
+          });
+          return Promise.race([target.evaluate(fn, arg), timeout]).finally(() => clearTimeout(t));
+        };
+      }
+      const v = target[prop];
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
+}
+
+/**
  * Run fn(page) with connect + one reconnect-retry on disconnect-class errors.
  * On unreachable Desktop, returns a structured object (does NOT throw).
  */
@@ -110,7 +148,7 @@ export async function withReport(fn) {
     return { connected: false, error: String(e.message || e), hint: HINT };
   }
   try {
-    return await fn(page);
+    return await fn(budgetedPage(page));
   } catch (e) {
     const msg = String((e && e.message) || e);
     if (DISCONNECT_RE.test(msg)) {
@@ -121,7 +159,7 @@ export async function withReport(fn) {
         return { connected: false, error: String((e2 && e2.message) || e2), hint: HINT };
       }
       try {
-        return await fn(page);
+        return await fn(budgetedPage(page));
       } catch (e3) {
         // second failure: surface as structured error, not a thrown MCP error
         return { connected: false, error: String((e3 && e3.message) || e3), hint: HINT };
