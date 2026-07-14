@@ -1,0 +1,22 @@
+{
+  "name": "pbi-webview2",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server that drives Power BI Desktop's WebView2 report canvas over CDP.",
+  "bin": {
+    "pbi-webview2": "server.js"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/smoke.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "playwright-core": "^1.61.1",
+    "zod": "^4.4.3"
+  }
+}

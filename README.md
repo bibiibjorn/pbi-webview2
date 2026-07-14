@@ -1,0 +1,95 @@
+# pbi-webview2 — MCP server for the live Power BI Desktop report canvas
+
+Drives Power BI Desktop's **WebView2 report canvas over CDP** (Chrome DevTools
+Protocol) and exposes the verified `pbi-ui-test` recipes as first-class MCP tools:
+switch pages, click slicers/buttons, fire bookmarks by name, read cards and matrices
+as data, judge cross-filters, scan for broken visuals, run the Performance Analyzer,
+capture value baselines, and screenshot — all against the **running** Desktop, no
+reload, no screenshot-OCR.
+
+Verified selectors/traps are copied faithfully from the `pbi-ui-test` skill and the
+vendor-neutral `General/Reporting/UI-Testing-CDP.md` canon (Desktop 2.155, 2026-07-14).
+
+## How it coexists with `playwright-pbi`
+
+Both attach to the **same CDP endpoint** (`http://127.0.0.1:9222`). CDP supports
+multiple simultaneous clients, so `pbi-webview2` and `playwright-pbi` can be registered
+at the same time and used interchangeably — `playwright-pbi` is the raw
+tag-then-act primitive lane; `pbi-webview2` is the higher-level, recipe-encoded lane
+(one tool = one full verified recipe). Neither closes Desktop on disconnect
+(`connectOverCDP` close only detaches).
+
+## Prerequisites (hard constraints)
+
+- **Launch Desktop with the debug port** — attach-later is impossible. Use
+  `~/.claude/scripts/pbi-desktop-debug.ps1 -Pbip "<path>.pbip"` (default port 9222).
+  The CDP port is launch-time only.
+- **Always `127.0.0.1`, never `localhost`** (localhost resolves IPv6 first and times
+  out; the port binds IPv4 loopback only).
+- Health check: `Invoke-RestMethod http://127.0.0.1:9222/json/version`.
+
+Tools connect **lazily** (first tool call), so Desktop may be launched after the MCP
+server starts. When Desktop is unreachable, every tool returns a structured
+`{connected:false, error, hint}` — never a thrown MCP error.
+
+## Environment variables
+
+| Var | Default | Purpose |
+|---|---|---|
+| `PBI_CDP_ENDPOINT` | `http://127.0.0.1:9222` | CDP endpoint to attach to. |
+| `PBI_OUTPUT_DIR` | `C:/Users/bjorn.braet/AppData/Local/Temp/claude/pbi-webview2-output` | Screenshots + baselines land here (never the repo/CWD). |
+
+## Tools
+
+| Tool | Key params | What it does |
+|---|---|---|
+| `pbi_status` | — | Connect + report build, title bar, active page, page count, zoom, canvasReady. |
+| `pbi_pages` | — | All page tabs `[{name, active}]`. |
+| `pbi_goto_page` | `name` | Exact-match page nav; verifies `aria-selected`; returns candidates on miss. |
+| `pbi_deselect` | — | Clear selection via the neighbour-page-and-back trick. |
+| `pbi_state_probe` | — | Batched scorecard (toggles, cards, badges, selectedCount, …). |
+| `pbi_read_cards` | — | Parsed cards `[{title, value}]`. |
+| `pbi_click` | `text?`, `ariaLabel?`, `selector?`, `ctrl?`, `index?` | Generic tag-then-act click with overlay-intercept coordinate fallback. |
+| `pbi_set_slicer` | `value`, `kind:button\|item` | Click a button/list slicer; returns before/after state. |
+| `pbi_fire_bookmark` | `name`, `group?`, `expectPage?` | Fire any bookmark via the View > Bookmarks pane (trusted click). |
+| `pbi_read_matrix` | `titleMatch?`, `index?` | Full grid as `{columns, rows, ariaRowCount, ariaColCount, complete}`. |
+| `pbi_matrix_expand` | `rowHeader`, `titleMatch?`, `collapse?` | Expand/collapse a hierarchy row; returns rowsBefore/After. |
+| `pbi_cross_filter_test` | `ariaLabel?`, `selector?`, `restore?` | Verdict: highlights rose OR card fingerprint changed. |
+| `pbi_hover_tooltip` | `selector?`, `ariaLabel?`, `offsetX?`, `offsetY?` | Trusted hover, read tooltip text. |
+| `pbi_scan_errors` | — | Broken-visual scan + non-benign console errors (+ benignFaviconCount). |
+| `pbi_perf_analyzer` | `captureQueryFor?` | Per-visual ms; optional visual-DAX capture via clipboard. |
+| `pbi_page_sweep` | `pages?`, `errorScan?` | Iterate pages, loadMs + error scan + card fingerprint; restores page. |
+| `pbi_baseline` | `action:capture\|compare\|list`, `name?`, `pages?` | Value-baseline capture/compare/list. |
+| `pbi_wait_for` | `text?`, `textGone?`, `timeoutMs?` | Poll body innerText until satisfied. |
+| `pbi_eval` | `js` | Escape hatch (rejects `powerBIAccessToken`). |
+| `pbi_screenshot` | `filename?`, `fullPage?` | Screenshot to the output dir. |
+
+## Registration (`.claude.json` / MCP config)
+
+```json
+{
+  "mcpServers": {
+    "pbi-webview2": {
+      "command": "node",
+      "args": ["C:/Users/bjorn.braet/.claude/scripts/pbi-mcp/server.js"],
+      "env": { "PBI_CDP_ENDPOINT": "http://127.0.0.1:9222" }
+    }
+  }
+}
+```
+
+## Hard rules
+
+- **`127.0.0.1` only** — never `localhost`.
+- **Launch Desktop via `pbi-desktop-debug.ps1`** — the CDP port cannot be attached later.
+- **Never save after test clicks** — every click mutates unsaved in-memory report
+  state. Restore slicers / active page when done (a CLEAR bookmark or
+  `pbi_deselect` helps); the sweep/baseline tools restore the starting page for you.
+- **Never read `window.powerBIAccessToken`** — `pbi_eval` rejects any code referencing it.
+- Screenshots and baselines go to `PBI_OUTPUT_DIR`, never the repo/CWD.
+
+## Test
+
+```
+npm test   # smoke test — passes WITHOUT Desktop running (asserts connected:false)
+```
