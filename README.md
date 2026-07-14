@@ -21,9 +21,9 @@ tag-then-act primitive lane; `pbi-webview2` is the higher-level, recipe-encoded 
 
 ## Prerequisites (hard constraints)
 
-- **Launch Desktop with the debug port** — attach-later is impossible. Use
-  `~/.claude/scripts/pbi-desktop-debug.ps1 -Pbip "<path>.pbip"` (default port 9222).
-  The CDP port is launch-time only.
+- **Launch Desktop with the debug port** — attach-later is impossible. Use the
+  **`pbi_launch {pbip:"<path>.pbip"}`** tool (or `~/.claude/scripts/pbi-desktop-debug.ps1
+  -Pbip "<path>.pbip"`, default port 9222). The CDP port is launch-time only.
 - **Always `127.0.0.1`, never `localhost`** (localhost resolves IPv6 first and times
   out; the port binds IPv4 loopback only).
 - Health check: `Invoke-RestMethod http://127.0.0.1:9222/json/version`.
@@ -43,6 +43,7 @@ server starts. When Desktop is unreachable, every tool returns a structured
 
 | Tool | Key params | What it does |
 |---|---|---|
+| `pbi_launch` | `pbip`, `port?`, `waitPortMs?` | Launch Desktop WITH the CDP port (replaces the ps1 step); pre-flight warns about orphaned PBIDesktop/msmdsrv; reports the running instance if the port is already up. After `cdpUp:true`, call `pbi_wait_for`. |
 | `pbi_status` | — | Connect + report build, title bar, active page, page count, zoom, canvasReady. |
 | `pbi_pages` | — | All page tabs `[{name, active}]`. |
 | `pbi_goto_page` | `name` | Exact-match page nav; verifies `aria-selected`; returns candidates on miss. |
@@ -63,7 +64,7 @@ server starts. When Desktop is unreachable, every tool returns a structured
 | `pbi_wait_for` | `text?`, `textGone?`, `timeoutMs?` | Poll body innerText until satisfied. |
 | `pbi_eval` | `js` | Escape hatch — page.evaluate (rejects `powerBIAccessToken`). |
 | `pbi_run_code` | `code` | TRUSTED escape hatch — runs `async (page) => …` with the real Playwright page (page.mouse/keyboard = trusted input). Rejects `powerBIAccessToken`. |
-| `pbi_snapshot` | `interestingOnly?`, `maxDepth?`, `filter?` | Accessibility-tree snapshot for structure discovery when a selector drifts. |
+| `pbi_snapshot` | `selector?`, `filter?`, `maxLines?` | Accessibility-tree (ARIA) snapshot for structure discovery when a selector drifts. |
 | `pbi_type` | `selector?`, `ariaLabel?`, `text`, `clear?`, `submit?` | Trusted-keyboard type into an editable element (clear/submit optional). |
 | `pbi_search_slicer` | `query`, `pick?`, `container?` | Type into a slicer search box; return filtered items; optional pick clicks the match. |
 | `pbi_context_menu` | `selector?`, `ariaLabel?`, `click?` | Right-click a data point/visual, read menu items; optional click invokes one (else Escape-closes). |
