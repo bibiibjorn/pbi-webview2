@@ -1,5 +1,5 @@
 /**
- * Tool catalog — registers all 20 pbi-webview2 tools on the McpServer.
+ * Tool catalog — registers all 24 pbi-webview2 tools on the McpServer.
  *
  * Every tool wraps its work in withReport(fn) (lazy connect + reconnect-retry),
  * returns compact JSON via ok(), and never leaks window.powerBIAccessToken.
@@ -1030,7 +1030,135 @@ export function registerTools(server) {
     }
   );
 
-  /* 20. pbi_screenshot ---------------------------------------------------- */
+  /* 21. pbi_type ---------------------------------------------------------- */
+  server.registerTool(
+    'pbi_type',
+    {
+      description:
+        'Type text into an editable element (input/textarea/contenteditable/searchbox/textbox) via TRUSTED keyboard input. Target resolution: selector > element whose aria-label includes ariaLabel > first visible search/text input. clear select-all-deletes first; submit presses Enter. Returns {typed, matchedLabel, submitted}. WARNING: real typing mutates report state — restore/clear when testing.',
+      inputSchema: {
+        selector: z.string().optional(),
+        ariaLabel: z.string().optional(),
+        text: z.string(),
+        clear: z.boolean().optional(),
+        submit: z.boolean().optional(),
+      },
+    },
+    async ({ selector, ariaLabel, text, clear, submit }) =>
+      guard(() =>
+        withReport(async (page) => {
+          const tag = await page.evaluate(F.tagEditable, { selector, ariaLabel });
+          if (!tag.found) return { connected: true, typed: false, reason: 'no editable target found' };
+          await robustClick(page, tag.selector, false); // focus
+          if (clear) {
+            await page.keyboard.press('Control+A');
+            await page.keyboard.press('Delete');
+          }
+          await page.keyboard.type(text);
+          if (submit) await page.keyboard.press('Enter');
+          return { connected: true, typed: true, matchedLabel: tag.matchedLabel, submitted: !!submit };
+        })
+      )
+  );
+
+  /* 22. pbi_search_slicer ------------------------------------------------- */
+  server.registerTool(
+    'pbi_search_slicer',
+    {
+      description:
+        "Type into a slicer's search box and (optionally) click the matching result. Focuses the box, clears it, types query, polls for filtered .slicerItemContainer items, returns them as matches. With pick, clicks the item equalling (then including) pick. Returns {searched, picked, pickedLabel?, matches} or {searched:false, reason}. Mutates a filter when pick clicks — restore after.",
+      inputSchema: {
+        query: z.string(),
+        pick: z.string().optional(),
+        container: z.string().optional(),
+      },
+    },
+    async ({ query, pick, container }) =>
+      guard(() =>
+        withReport(async (page) => {
+          const tag = await page.evaluate(F.tagSlicerSearch, { container });
+          if (!tag.found) return { connected: true, searched: false, reason: 'no slicer search box found' };
+          await robustClick(page, tag.selector, false); // focus
+          await page.keyboard.press('Control+A');
+          await page.keyboard.press('Delete');
+          await page.keyboard.type(query);
+          // Poll (~4s) for the item list to settle to the filtered set.
+          const res = await poll(
+            () => page.evaluate(F.readSlicerItems),
+            () => true,
+            4000
+          );
+          const matches = (res.value || []).map((o) => o.label);
+          if (!pick) {
+            return { connected: true, searched: true, picked: false, matches };
+          }
+          const pickTag = await page.evaluate(F.tagSlicerSearchPick, pick);
+          if (!pickTag.found) {
+            return { connected: true, searched: true, picked: false, reason: 'pick not found', matches };
+          }
+          await robustClick(page, pickTag.selector, false);
+          await new Promise((r) => setTimeout(r, 400));
+          return {
+            connected: true,
+            searched: true,
+            picked: true,
+            pickedLabel: pickTag.pickedLabel,
+            matches,
+          };
+        })
+      )
+  );
+
+  /* 23. pbi_context_menu -------------------------------------------------- */
+  server.registerTool(
+    'pbi_context_menu',
+    {
+      description:
+        'Right-click a data point / visual to open its context menu and read the items (drillthrough, Show as a table, Summarize, …). Right-clicks at the on-path point for SVG (else bbox center). With click, invokes the menu item matching (exact then contains) it and returns {opened, items, clicked, clickedItem}. Without click, reads items then presses Escape to CLOSE the menu (leaves no menu open). Returns {opened:false, reason} if no menu appeared.',
+      inputSchema: {
+        selector: z.string().optional(),
+        ariaLabel: z.string().optional(),
+        click: z.string().optional(),
+      },
+    },
+    async ({ selector, ariaLabel, click }) =>
+      guard(() =>
+        withReport(async (page) => {
+          const tag = await page.evaluate(F.tagForContext, { selector, ariaLabel });
+          if (!tag.found) return { connected: true, opened: false, reason: 'target not found' };
+          // On-path point for thin SVG geometry (bbox center misses arcs); else bbox center.
+          const pt = await page.evaluate(F.clickPointForSelector, { selector: tag.selector });
+          if (!pt || !pt.found) return { connected: true, opened: false, reason: 'no bounding box' };
+          await page.mouse.click(pt.x, pt.y, { button: 'right' });
+          // Poll (~3s) for a visible menu.
+          const res = await poll(
+            () => page.evaluate(F.readMenuItems),
+            (v) => v && v.menuOpen && v.items.length > 0,
+            3000
+          );
+          if (!res.satisfied || !res.value || !res.value.menuOpen) {
+            return { connected: true, opened: false, reason: 'no context menu appeared', matchedLabel: tag.matchedLabel };
+          }
+          const items = res.value.items;
+          if (click) {
+            const mi = await page.evaluate(F.tagMenuItem, click);
+            if (!mi.found) {
+              // Leave nothing open on a failed pick.
+              await page.keyboard.press('Escape');
+              return { connected: true, opened: true, items, clicked: false, reason: 'menu item not found' };
+            }
+            await robustClick(page, mi.selector, false);
+            return { connected: true, opened: true, items, clicked: true, clickedItem: mi.matchedItem };
+          }
+          // Non-click path: read then CLOSE the menu (leave no menu open).
+          await page.keyboard.press('Escape');
+          await page.evaluate(() => 1); // let the Escape settle
+          return { connected: true, opened: true, items, matchedLabel: tag.matchedLabel };
+        })
+      )
+  );
+
+  /* 24. pbi_screenshot ---------------------------------------------------- */
   server.registerTool(
     'pbi_screenshot',
     {

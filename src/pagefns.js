@@ -789,3 +789,207 @@ export function readTooltip() {
     .join(' | ');
   return txt || null;
 }
+
+/* -------------------------------------------------------------- typing/input */
+
+/**
+ * Tag an editable target for trusted keyboard typing. Resolution order:
+ *  explicit `selector` > element whose aria-label includes `ariaLabel` >
+ *  first VISIBLE search/text input in the DOM.
+ * Editable = input / textarea / [contenteditable] / [role=searchbox] /
+ * [role=textbox]. Returns {found, selector, matchedLabel}.
+ */
+export function tagEditable(arg) {
+  const { selector, ariaLabel } = arg || {};
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  const editableSel =
+    'input:not([type=hidden]):not([type=button]):not([type=checkbox]):not([type=radio]):not([type=submit]), ' +
+    'textarea, [contenteditable=""], [contenteditable="true"], [role="searchbox"], [role="textbox"]';
+  const isVisible = (el) => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  let el = null;
+  if (selector) {
+    try { el = document.querySelector(selector); } catch (e) { el = null; }
+  } else if (ariaLabel) {
+    const cands = q(editableSel).filter(isVisible);
+    el =
+      cands.find((e) => (e.getAttribute('aria-label') || '').trim() === ariaLabel) ||
+      cands.find((e) => (e.getAttribute('aria-label') || '').includes(ariaLabel)) ||
+      null;
+  } else {
+    const cands = q(editableSel).filter(isVisible);
+    // Prefer a search-flavoured input first, then any text input.
+    el =
+      cands.find(
+        (e) =>
+          e.getAttribute('type') === 'search' ||
+          e.getAttribute('role') === 'searchbox' ||
+          /search/i.test(e.getAttribute('aria-label') || '') ||
+          /search/i.test(e.className || '')
+      ) ||
+      cands[0] ||
+      null;
+  }
+  if (!el) return { found: false, selector: null, matchedLabel: null };
+  document.querySelectorAll('[data-pw="pw-type"]').forEach(function (e) { e.removeAttribute('data-pw'); });
+  el.setAttribute('data-pw', 'pw-type');
+  return {
+    found: true,
+    selector: '[data-pw="pw-type"]',
+    matchedLabel: (el.getAttribute('aria-label') || '').trim() || null,
+  };
+}
+
+/* ----------------------------------------------------------- slicer search */
+
+/**
+ * Tag a slicer's search box. PBI search inputs are typically `input.searchInput`,
+ * `input[type=search]`, or `[aria-label*="Search" i]` inside a `.slicer` /
+ * `.slicerContainer` / `.visualContainer`. If `container` given, scope to the
+ * visual whose title/aria-label includes it. Returns {found, selector}.
+ */
+export function tagSlicerSearch(arg) {
+  const { container } = arg || {};
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  const searchSel =
+    'input.searchInput, input[type="search"], [aria-label*="Search" i]';
+  const isVisible = (el) => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const labelOf = (host) =>
+    (host.getAttribute('aria-label') || '') +
+    ' ' +
+    ((host.querySelector('[aria-label]') && host.querySelector('[aria-label]').getAttribute('aria-label')) || '') +
+    ' ' +
+    ((host.querySelector('.visualTitle, .title') && host.querySelector('.visualTitle, .title').textContent) || '');
+  // Candidate slicer hosts.
+  let hosts = q('.slicer, .slicerContainer, .visualContainer');
+  if (container) {
+    const lc = container.toLowerCase();
+    hosts = hosts.filter((h) => labelOf(h).toLowerCase().includes(lc));
+  }
+  let box = null;
+  for (const h of hosts) {
+    const inp = Array.from(h.querySelectorAll(searchSel)).find(isVisible);
+    if (inp) { box = inp; break; }
+  }
+  // Fallback: any visible search box on the page (no container filter given).
+  if (!box && !container) {
+    box = q(searchSel).find(isVisible) || null;
+  }
+  if (!box) return { found: false, selector: null };
+  document.querySelectorAll('[data-pw="pw-slicersearch"]').forEach(function (e) { e.removeAttribute('data-pw'); });
+  box.setAttribute('data-pw', 'pw-slicersearch');
+  return { found: true, selector: '[data-pw="pw-slicersearch"]' };
+}
+
+/** Read the currently visible slicer items as [{label}] (aria-label else text). */
+export function readSlicerItems() {
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  return q('.slicerItemContainer')
+    .filter((el) => {
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    })
+    .map((el) => ({
+      label: (el.getAttribute('aria-label') || '').trim() || (el.textContent || '').trim(),
+    }))
+    .filter((o) => o.label);
+}
+
+/**
+ * Tag a slicer item (from a search-filtered list) by exact label, then contains.
+ * Matches against aria-label, then textContent. Returns {found, selector, pickedLabel}.
+ */
+export function tagSlicerSearchPick(value) {
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  const items = q('.slicerItemContainer').filter((el) => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  });
+  const labelOf = (el) => (el.getAttribute('aria-label') || '').trim() || (el.textContent || '').trim();
+  let el =
+    items.find((it) => labelOf(it) === value) ||
+    items.find((it) => labelOf(it).includes(value));
+  if (!el) return { found: false, selector: null };
+  document.querySelectorAll('[data-pw="pw-slicerpick"]').forEach(function (e) { e.removeAttribute('data-pw'); });
+  el.setAttribute('data-pw', 'pw-slicerpick');
+  return { found: true, selector: '[data-pw="pw-slicerpick"]', pickedLabel: labelOf(el) };
+}
+
+/* --------------------------------------------------------- context menu */
+
+/**
+ * Tag a target for a right-click context menu. Match priority:
+ *  selector (querySelectorAll first) > ariaLabel (exact, then contains) >
+ *  text (exact, then contains). SVG data points included. Stamps `pw-ctx`.
+ * Returns {found, selector, matchedLabel}.
+ */
+export function tagForContext(arg) {
+  const { text, ariaLabel, selector } = arg || {};
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  let el = null;
+  if (selector) {
+    try { el = document.querySelector(selector); } catch (e) { el = null; }
+  } else if (ariaLabel) {
+    const all = q('[aria-label]');
+    el =
+      all.find((e) => (e.getAttribute('aria-label') || '').trim() === ariaLabel) ||
+      all.find((e) => (e.getAttribute('aria-label') || '').includes(ariaLabel)) ||
+      null;
+  } else if (text) {
+    const all = q('[role="button"], button, [role="tab"], .slicerItemContainer, a, span, div, path, rect, circle');
+    let matches = all.filter((e) => (e.textContent || '').trim() === text);
+    if (!matches.length) {
+      matches = all.filter((e) => (e.textContent || '').trim().includes(text));
+      matches.sort((a, b) => (a.textContent || '').length - (b.textContent || '').length);
+    }
+    el = matches[0] || null;
+  }
+  if (!el) return { found: false, selector: null, matchedLabel: null };
+  document.querySelectorAll('[data-pw="pw-ctx"]').forEach(function (e) { e.removeAttribute('data-pw'); });
+  el.setAttribute('data-pw', 'pw-ctx');
+  return {
+    found: true,
+    selector: '[data-pw="pw-ctx"]',
+    matchedLabel:
+      (el.getAttribute && el.getAttribute('aria-label')) || (el.textContent || '').trim().slice(0, 120) || null,
+  };
+}
+
+/** Read the visible context-menu item texts ([role=menuitem], visible only). */
+export function readMenuItems() {
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  const menuOpen = q('[role="menu"]').some((m) => {
+    const r = m.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  });
+  const items = q('[role="menuitem"]')
+    .filter((el) => {
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    })
+    .map((el) => (el.getAttribute('aria-label') || el.textContent || '').trim())
+    .filter(Boolean);
+  return { menuOpen, items };
+}
+
+/** Tag a context-menu item by text: exact then contains. Returns {found, selector, matchedItem}. */
+export function tagMenuItem(text) {
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  const items = q('[role="menuitem"]').filter((el) => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  });
+  const textOf = (el) => (el.getAttribute('aria-label') || el.textContent || '').trim();
+  let el =
+    items.find((it) => textOf(it) === text) ||
+    items.find((it) => textOf(it).includes(text));
+  if (!el) return { found: false, selector: null };
+  document.querySelectorAll('[data-pw="pw-menuitem"]').forEach(function (e) { e.removeAttribute('data-pw'); });
+  el.setAttribute('data-pw', 'pw-menuitem');
+  return { found: true, selector: '[data-pw="pw-menuitem"]', matchedItem: textOf(el) };
+}
