@@ -1035,7 +1035,7 @@ export function registerTools(server) {
     'pbi_type',
     {
       description:
-        'Type text into an editable element (input/textarea/contenteditable/searchbox/textbox) via TRUSTED keyboard input. Target resolution: selector > element whose aria-label includes ariaLabel > first visible search/text input. clear select-all-deletes first; submit presses Enter. Returns {typed, matchedLabel, submitted}. WARNING: real typing mutates report state — restore/clear when testing.',
+        'Type text into an editable element (input/textarea/contenteditable/searchbox/textbox) via TRUSTED keyboard input. Target resolution: selector > element whose aria-label includes ariaLabel > first visible search/text input. Focuses the input IN-PAGE and ABORTS (typed:false) if focus does not land on it — never sends keystrokes to the canvas. clear empties the input via its own value (no global select-all); submit presses Enter. Returns {typed, matchedLabel, cleared, submitted}. WARNING: real typing mutates report state — restore/clear when testing.',
       inputSchema: {
         selector: z.string().optional(),
         ariaLabel: z.string().optional(),
@@ -1067,7 +1067,7 @@ export function registerTools(server) {
     'pbi_search_slicer',
     {
       description:
-        "Type into a slicer's search box and (optionally) click the matching result. Focuses the box, clears it, types query, polls for filtered .slicerItemContainer items, returns them as matches. With pick, clicks the item equalling (then including) pick. Returns {searched, picked, pickedLabel?, matches} or {searched:false, reason}. Mutates a filter when pick clicks — restore after.",
+        "Type into a slicer's search box and (optionally) click the matching result. Focuses the box IN-PAGE and ABORTS (searched:false) if focus does not land on it — never sends keystrokes to the canvas (a mis-focused select-all+delete once removed all page visuals). Clears via the input's own value, types query, polls for filtered .slicerItemContainer items, returns them as matches. With pick, clicks the item equalling (then including) pick. Returns {searched, picked, pickedLabel?, matches} or {searched:false, reason}. Mutates a filter when pick clicks — restore after.",
       inputSchema: {
         query: z.string(),
         pick: z.string().optional(),
