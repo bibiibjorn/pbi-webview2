@@ -38,11 +38,19 @@ async function guard(fn) {
 }
 
 /** Short poll: run probe() until predicate(v) is true or timeout; returns {value, elapsedMs, satisfied}. */
-async function poll(probe, predicate, timeoutMs, intervalMs = 200) {
+async function poll(probe, predicate, timeoutMs, intervalMs = 1000) {
   const start = Date.now();
+  const effectiveInterval = (() => {
+    if (process.env.PBI_POLL_MS) {
+      const v = parseInt(process.env.PBI_POLL_MS, 10);
+      if (!Number.isNaN(v)) return v;
+    }
+    return intervalMs;
+  })();
+  await new Promise((r) => setTimeout(r, 500));
   let value = await probe();
   while (!predicate(value) && Date.now() - start < timeoutMs) {
-    await new Promise((r) => setTimeout(r, intervalMs));
+    await new Promise((r) => setTimeout(r, effectiveInterval));
     value = await probe();
   }
   return { value, elapsedMs: Date.now() - start, satisfied: predicate(value) };
@@ -134,10 +142,16 @@ export function registerTools(server) {
     'pbi_goto_page',
     {
       description:
-        'Navigate to a page by EXACT name. Verifies aria-selected after; on not-found returns closest candidates.',
-      inputSchema: { name: z.string().describe('Exact page display name') },
+        'Navigate to a page by EXACT name. Returns as soon as the tab switches (the canvas may still be rendering — use pbi_wait_for before reading values); waitReady:true blocks until visuals are painted. On not-found returns closest candidates.',
+      inputSchema: {
+        name: z.string().describe('Exact page display name'),
+        waitReady: z
+          .boolean()
+          .optional()
+          .describe('Wait (up to 30s) for the canvas to paint visuals before returning; default false'),
+      },
     },
-    async ({ name }) =>
+    async ({ name, waitReady }) =>
       guard(() =>
         withReport(async (page) => {
           const tag = await page.evaluate(F.tagPageTab, name);
@@ -145,14 +159,25 @@ export function registerTools(server) {
             return { connected: true, navigated: false, reason: 'not-found', candidates: tag.candidates };
           }
           await robustClick(page, tag.selector, false);
-          // Wait for the tab to switch AND the canvas to render its visuals — not just
-          // aria-selected. Downstream reads (matrix/cross-filter) hit an empty canvas
-          // otherwise. Poll pageMetadata for activePage + canvasReady + a visual painted.
+          // The tab switches instantly; the visuals then re-query for seconds-to-minutes
+          // on heavy pages. Each page.evaluate queues BEHIND that render work, so keeping
+          // a readiness poll running pins an evaluate against the busy canvas the whole
+          // time. Default: confirm the tab switched (cheap) and get out of the way.
+          const nav = await poll(() => page.evaluate(F.activePageName), (v) => v === name, 6000);
+          if (!waitReady) {
+            return {
+              connected: true,
+              navigated: nav.satisfied,
+              activePage: nav.value,
+              canvasReady: null,
+              elapsedMs: nav.elapsedMs,
+              hint: 'canvas may still be rendering; pbi_wait_for {text} or pbi_state_probe before reading values',
+            };
+          }
           const res = await poll(
             () => page.evaluate(F.pageMetadata),
             (v) => v && v.activePage === name && v.canvasReady && v.visibleVisualCount > 0,
-            8000,
-            250
+            30000
           );
           // Small settle so late-binding visuals (grids, SVG series) finish painting.
           if (res.satisfied) await new Promise((r) => setTimeout(r, 700));
@@ -409,8 +434,7 @@ export function registerTools(server) {
             const res = await poll(
               () => page.evaluate(F.activePageName),
               () => true,
-              2500,
-              250
+              2500
             );
             const landedPage = res.value;
             if (expectPage && landedPage !== expectPage) {
@@ -501,8 +525,7 @@ export function registerTools(server) {
               return page.evaluate(F.taggedMatrixRowCount);
             },
             (v) => v != null && v !== rowsBefore,
-            5000,
-            300
+            5000
           );
           return {
             connected: true,
@@ -541,8 +564,7 @@ export function registerTools(server) {
           const res = await poll(
             () => page.evaluate(F.crossFilterProbe),
             (v) => v.highlights > before.highlights || v.fingerprint !== before.fingerprint,
-            6000,
-            300
+            6000
           );
           const after = res.value;
           const cardsAfter = await page.evaluate(F.readCards);
@@ -562,8 +584,7 @@ export function registerTools(server) {
               const rres = await poll(
                 () => page.evaluate(F.crossFilterProbe),
                 (v) => v.fingerprint === before.fingerprint,
-                5000,
-                300
+                5000
               );
               restored = rres.satisfied;
             }
@@ -612,8 +633,7 @@ export function registerTools(server) {
           const res = await poll(
             () => page.evaluate(F.readTooltip),
             (v) => v != null,
-            2500,
-            200
+            2500
           );
           // Move to a neutral corner after.
           await page.mouse.move(5, 5);
@@ -767,8 +787,7 @@ export function registerTools(server) {
                 const ready = await poll(
                   () => page.evaluate(F.pageMetadata),
                   (v) => v.activePage === name && v.canvasReady,
-                  30000,
-                  300
+                  30000
                 );
                 const loadMs = Date.now() - t0;
                 const entry = { page: name, navigated: ready.value.activePage === name, loadMs, canvasReady: ready.value.canvasReady };
@@ -791,7 +810,7 @@ export function registerTools(server) {
                 const bt = await page.evaluate(F.tagPageTab, startedOn);
                 if (bt.found) {
                   await robustClick(page, bt.selector, false);
-                  await poll(() => page.evaluate(F.activePageName), (v) => v === startedOn, 15000, 300);
+                  await poll(() => page.evaluate(F.activePageName), (v) => v === startedOn, 15000);
                   restoredTo = await page.evaluate(F.activePageName);
                 }
               } catch (e) { /* best-effort restore */ }
@@ -841,8 +860,7 @@ export function registerTools(server) {
                 await poll(
                   () => page.evaluate(F.pageMetadata),
                   (v) => v.activePage === pg && v.canvasReady,
-                  30000,
-                  300
+                  30000
                 );
               }
               const s = await page.evaluate(F.stateProbe);
@@ -853,7 +871,7 @@ export function registerTools(server) {
               const bt = await page.evaluate(F.tagPageTab, original);
               if (bt.found) {
                 await robustClick(page, bt.selector, false);
-                await poll(() => page.evaluate(F.activePageName), (v) => v === original, 15000, 300);
+                await poll(() => page.evaluate(F.activePageName), (v) => v === original, 15000);
               }
             }
             return snap;
@@ -931,8 +949,7 @@ export function registerTools(server) {
               if (textGone && body.includes(textGone)) return false;
               return true;
             },
-            timeoutMs,
-            200
+            timeoutMs
           );
           return { connected: true, satisfied: res.satisfied, elapsedMs: res.elapsedMs };
         })

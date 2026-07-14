@@ -97,11 +97,8 @@ export function pageMetadata() {
     if (zt) zoom = zt;
   }
 
-  const visibleVisualCount = q('.visualContainer').filter((el) => {
-    const r = el.getBoundingClientRect();
-    return r.width > 0 && r.height > 0;
-  }).length;
-  const canvasReady = tabs.length > 0 && q('.visualContainer').length > 0;
+  const visibleVisualCount = q('.visualContainer').length;
+  const canvasReady = tabs.length > 0 && visibleVisualCount > 0;
 
   return {
     titleBar,
@@ -751,9 +748,9 @@ export function tagPerfCopyQuery(visualName) {
 
 /* ---------------------------------------------------------- generic helpers */
 
-/** body innerText (for wait_for text polling). */
+/** body textContent (reflow-free) (for wait_for text polling). */
 export function bodyText() {
-  return document.body ? document.body.innerText || '' : '';
+  return document.body ? document.body.textContent || '' : '';
 }
 
 /** Tag an element for hover by selector or ariaLabel; returns {found, selector}. */
