@@ -75,7 +75,9 @@ async function connect() {
   _page = null;
   let browser;
   try {
-    browser = await chromium.connectOverCDP(CDP_ENDPOINT, { timeout: 8000 });
+    // Attach to this WebView2 costs ~8s on a heavy report (measured raw-CDP:
+    // first Runtime.evaluate 7.7s, subsequent 13ms) — 8s timeout raced it.
+    browser = await chromium.connectOverCDP(CDP_ENDPOINT, { timeout: 30000 });
   } catch (e) {
     const err = new Error(`CDP connect failed at ${CDP_ENDPOINT}: ${e.message || e}`);
     err.unreachable = true;
@@ -93,6 +95,13 @@ async function connect() {
   _browser = browser;
   _page = page;
   attachListeners(page);
+  // Warm-up: the FIRST evaluate on a fresh attach pays ~8s of context discovery
+  // (measured); pay it here once so tool calls start from the 13ms warm path.
+  try {
+    await page.evaluate(() => 1);
+  } catch (e) {
+    /* non-fatal — the first tool call just pays the cost instead */
+  }
   return page;
 }
 
@@ -104,7 +113,7 @@ async function connect() {
  */
 const EVAL_BUDGET_MS = (() => {
   const v = parseInt(process.env.PBI_EVAL_BUDGET_MS || '', 10);
-  return Number.isNaN(v) ? 10000 : v;
+  return Number.isNaN(v) ? 30000 : v; // first-touch after attach ≈8s; renders can hold the thread longer
 })();
 
 // Single-flight gate: at most ONE of our evaluates may be pending against the
