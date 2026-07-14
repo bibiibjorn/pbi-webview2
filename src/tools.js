@@ -1049,14 +1049,15 @@ export function registerTools(server) {
         withReport(async (page) => {
           const tag = await page.evaluate(F.tagEditable, { selector, ariaLabel });
           if (!tag.found) return { connected: true, typed: false, reason: 'no editable target found' };
-          await robustClick(page, tag.selector, false); // focus
-          if (clear) {
-            await page.keyboard.press('Control+A');
-            await page.keyboard.press('Delete');
-          }
+          // SAFETY: focus the input IN-PAGE and verify it is document.activeElement
+          // BEFORE any keystroke. If focus is not on our input, ABORT — never send
+          // Ctrl+A/Delete/type to the canvas (that deletes visuals).
+          const foc = await page.evaluate(F.focusAndClearEditable, !!clear);
+          if (!foc.isActive)
+            return { connected: true, typed: false, reason: `input did not take focus (${foc.reason || 'unknown'}); aborted to avoid canvas edits` };
           await page.keyboard.type(text);
           if (submit) await page.keyboard.press('Enter');
-          return { connected: true, typed: true, matchedLabel: tag.matchedLabel, submitted: !!submit };
+          return { connected: true, typed: true, matchedLabel: tag.matchedLabel, cleared: foc.cleared, submitted: !!submit };
         })
       )
   );
@@ -1078,9 +1079,12 @@ export function registerTools(server) {
         withReport(async (page) => {
           const tag = await page.evaluate(F.tagSlicerSearch, { container });
           if (!tag.found) return { connected: true, searched: false, reason: 'no slicer search box found' };
-          await robustClick(page, tag.selector, false); // focus
-          await page.keyboard.press('Control+A');
-          await page.keyboard.press('Delete');
+          // SAFETY: focus + verify the search box is document.activeElement BEFORE
+          // any keystroke. If it did not take focus, ABORT — never Ctrl+A/Delete/type
+          // against the canvas (that select-all + delete removed all page visuals).
+          const foc = await page.evaluate(F.focusAndClearEditable, true);
+          if (!foc.isActive)
+            return { connected: true, searched: false, reason: `search box did not take focus (${foc.reason || 'unknown'}); aborted to avoid canvas edits` };
           await page.keyboard.type(query);
           // Poll (~4s) for the item list to settle to the filtered set.
           const res = await poll(

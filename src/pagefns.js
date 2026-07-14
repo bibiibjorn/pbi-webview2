@@ -793,6 +793,43 @@ export function readTooltip() {
 /* -------------------------------------------------------------- typing/input */
 
 /**
+ * Focus a tagged editable IN-PAGE and clear it WITHOUT a global select-all.
+ * CRITICAL SAFETY: never rely on a mouse click to focus a text input before
+ * sending Ctrl+A / Delete — if the click misses and focus is on the report
+ * canvas, Ctrl+A selects every VISUAL and Delete DELETES them (this exact bug
+ * emptied a page). Instead call el.focus() directly, confirm document.activeElement
+ * IS our input, and clear via the input's own value/selection. Returns
+ * {focused, isActive, cleared}. If not focused/active, the caller MUST NOT type.
+ */
+export function focusAndClearEditable(doClear) {
+  const el = document.querySelector('[data-pw="pw-type"], [data-pw="pw-slicersearch"]');
+  if (!el) return { focused: false, isActive: false, cleared: false, reason: 'no tagged input' };
+  try { el.focus(); } catch (e) { /* ignore */ }
+  const isActive = document.activeElement === el;
+  if (!isActive) {
+    // Do NOT proceed — typing/clearing now would hit the canvas.
+    return { focused: false, isActive: false, cleared: false, reason: 'input did not take focus' };
+  }
+  let cleared = false;
+  if (doClear) {
+    if ('value' in el) {
+      // Native input/textarea: set value + fire input so the slicer re-filters,
+      // then place caret at end. No global select-all anywhere.
+      const proto = Object.getPrototypeOf(el);
+      const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+      if (desc && desc.set) desc.set.call(el, ''); else el.value = '';
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      cleared = true;
+    } else if (el.isContentEditable) {
+      el.textContent = '';
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      cleared = true;
+    }
+  }
+  return { focused: true, isActive: true, cleared };
+}
+
+/**
  * Tag an editable target for trusted keyboard typing. Resolution order:
  *  explicit `selector` > element whose aria-label includes `ariaLabel` >
  *  first VISIBLE search/text input in the DOM.
