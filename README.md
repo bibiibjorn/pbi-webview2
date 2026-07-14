@@ -61,7 +61,9 @@ server starts. When Desktop is unreachable, every tool returns a structured
 | `pbi_page_sweep` | `pages?`, `errorScan?` | Iterate pages, loadMs + error scan + card fingerprint; restores page. |
 | `pbi_baseline` | `action:capture\|compare\|list`, `name?`, `pages?` | Value-baseline capture/compare/list. |
 | `pbi_wait_for` | `text?`, `textGone?`, `timeoutMs?` | Poll body innerText until satisfied. |
-| `pbi_eval` | `js` | Escape hatch (rejects `powerBIAccessToken`). |
+| `pbi_eval` | `js` | Escape hatch — page.evaluate (rejects `powerBIAccessToken`). |
+| `pbi_run_code` | `code` | TRUSTED escape hatch — runs `async (page) => …` with the real Playwright page (page.mouse/keyboard = trusted input). Rejects `powerBIAccessToken`. |
+| `pbi_snapshot` | `interestingOnly?`, `maxDepth?`, `filter?` | Accessibility-tree snapshot for structure discovery when a selector drifts. |
 | `pbi_type` | `selector?`, `ariaLabel?`, `text`, `clear?`, `submit?` | Trusted-keyboard type into an editable element (clear/submit optional). |
 | `pbi_search_slicer` | `query`, `pick?`, `container?` | Type into a slicer search box; return filtered items; optional pick clicks the match. |
 | `pbi_context_menu` | `selector?`, `ariaLabel?`, `click?` | Right-click a data point/visual, read menu items; optional click invokes one (else Escape-closes). |

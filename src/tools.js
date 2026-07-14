@@ -1,5 +1,5 @@
 /**
- * Tool catalog — registers all 24 pbi-webview2 tools on the McpServer.
+ * Tool catalog — registers all 26 pbi-webview2 tools on the McpServer.
  *
  * Every tool wraps its work in withReport(fn) (lazy connect + reconnect-retry),
  * returns compact JSON via ok(), and never leaks window.powerBIAccessToken.
@@ -1028,6 +1028,74 @@ export function registerTools(server) {
         })
       );
     }
+  );
+
+  /* 19b. pbi_run_code ----------------------------------------------------- */
+  // Trusted escape hatch: the browser_run_code_unsafe equivalent. Unlike pbi_eval
+  // (page.evaluate — synthetic DOM events Desktop IGNORES), this hands the caller
+  // the real Playwright `page`, so page.mouse / page.keyboard produce TRUSTED input.
+  // This is what lets us rediscover selectors and drive interactions the 24 canned
+  // tools don't cover, WITHOUT depending on the playwright-pbi server.
+  server.registerTool(
+    'pbi_run_code',
+    {
+      description:
+        'TRUSTED escape hatch (browser_run_code_unsafe equivalent). Runs an async JS function with the live Playwright reportView `page` — page.mouse/page.keyboard give REAL trusted input (unlike pbi_eval, which is page.evaluate and cannot do trusted clicks/keys). Use for rediscovery + interactions the canned tools do not cover. The code string must be an async arrow/function taking (page); its return value is JSON-serialized. Rejects powerBIAccessToken. UNSAFE: arbitrary automation — mutating clicks change report state, so restore after. NOTE inside page.evaluate sandboxes setTimeout is undefined — use page.waitForTimeout(ms).',
+      inputSchema: { code: z.string().describe('async (page) => { ... } — returns JSON-serializable') },
+    },
+    async ({ code }) => {
+      if (/powerBIAccessToken/i.test(code)) {
+        return ok({ rejected: true, error: 'Refused: code references powerBIAccessToken (token access is forbidden).' });
+      }
+      return guard(() =>
+        withReport(async (page) => {
+          // Hand the RAW page to the caller's function (trusted input path). The
+          // budgetedPage proxy still guards its page.evaluate calls.
+          // eslint-disable-next-line no-eval
+          const fn = eval('(' + code.trim() + ')');
+          if (typeof fn !== 'function') return { connected: true, error: 'code must be an (async) function of (page)' };
+          const result = await fn(page);
+          return { connected: true, result: result === undefined ? null : result };
+        })
+      );
+    }
+  );
+
+  /* 19c. pbi_snapshot ----------------------------------------------------- */
+  // Accessibility-tree snapshot — the browser_snapshot equivalent for structure
+  // discovery when a selector drifts. Reads the a11y tree via page.accessibility.
+  server.registerTool(
+    'pbi_snapshot',
+    {
+      description:
+        'Accessibility-tree snapshot of the reportView page (browser_snapshot equivalent) for structure discovery when a selector drifts. Returns a compact tree of {role, name, and optionally box}. interestingOnly:true (default) prunes decorative nodes; maxDepth caps depth; filter (regex string) keeps only nodes whose role/name matches. Read-only.',
+      inputSchema: {
+        interestingOnly: z.boolean().optional(),
+        maxDepth: z.number().int().optional(),
+        filter: z.string().optional().describe('Regex; keep only nodes whose role or name matches'),
+      },
+    },
+    async ({ interestingOnly = true, maxDepth = 12, filter }) =>
+      guard(() =>
+        withReport(async (page) => {
+          const root = await page.accessibility.snapshot({ interestingOnly });
+          if (!root) return { connected: true, tree: null, note: 'empty a11y snapshot' };
+          let re = null;
+          if (filter) { try { re = new RegExp(filter, 'i'); } catch (e) { re = null; } }
+          const prune = (node, depth) => {
+            if (depth > maxDepth) return null;
+            const kids = (node.children || [])
+              .map((c) => prune(c, depth + 1))
+              .filter(Boolean);
+            const self = { role: node.role, name: node.name };
+            if (kids.length) self.children = kids;
+            if (re && !re.test(node.role || '') && !re.test(node.name || '') && !kids.length) return null;
+            return self;
+          };
+          const tree = prune(root, 0);
+          return { connected: true, tree };
+        })
+      )
   );
 
   /* 21. pbi_type ---------------------------------------------------------- */
