@@ -1086,35 +1086,39 @@ export function readDaxResults() {
     if (t && t.length < 800 && errRe.test(t)) { error = t; break; }
   }
 
-  // Results grid. Prefer an ag-grid; else any visible [role="grid"].
-  let grid =
-    q('.ag-root').find(isVisible) ||
-    q('[role="grid"]').find(isVisible) ||
-    null;
-  if (!grid) return { hasResult: false, error };
+  // Results grid. The DAX query view (Desktop 2.155, verified 2026-07-15) has NO
+  // `.ag-root` / `[role="grid"]` wrapper and NO `[role="columnheader"]` — it renders
+  // ARIA rows of `[role="gridcell"]` directly, with the HEADER row's cells holding the
+  // bracketed column names like `[check]` / `[build]`. So: collect ALL visible
+  // `[role="row"]` that contain `[role="gridcell"]`, scoped to a results container if
+  // one is identifiable, and treat a leading all-`[...]` row as the column headers.
+  const rowEls = q('[role="row"]')
+    .filter(isVisible)
+    .filter((r) => r.querySelector('[role="gridcell"]'));
+  if (!rowEls.length) return { hasResult: false, error };
 
-  const columns = [];
-  const rows = [];
-  // ag-grid: headers in .ag-header-cell-text; rows in [role="row"] with [role="gridcell"].
-  const headerEls = Array.from(grid.querySelectorAll('.ag-header-cell-text'));
-  if (headerEls.length) {
-    for (const h of headerEls) columns.push((h.textContent || '').trim());
-  } else {
-    // generic grid: first row of columnheaders
-    const hr = grid.querySelector('[role="row"]');
-    if (hr) {
-      for (const c of hr.querySelectorAll('[role="columnheader"]')) columns.push((c.textContent || '').trim());
-    }
-  }
-  const rowEls = Array.from(grid.querySelectorAll('[role="row"]')).filter((r) =>
-    r.querySelector('[role="gridcell"]')
+  const rowValues = rowEls.map((r) =>
+    Array.from(r.querySelectorAll('[role="gridcell"]')).map((c) => (c.textContent || '').trim())
   );
-  for (const r of rowEls) {
-    if (rows.length >= 200) break;
-    const cells = Array.from(r.querySelectorAll('[role="gridcell"]')).map((c) => (c.textContent || '').trim());
-    if (cells.length) rows.push(cells);
+
+  // A header row = every cell is a `[name]`-style column token (brackets), or the
+  // grid exposes explicit columnheaders. Prefer explicit headers if present anywhere.
+  let columns = [];
+  const explicitHeaders = q('[role="columnheader"]').filter(isVisible).map((c) => (c.textContent || '').trim());
+  if (explicitHeaders.length) {
+    columns = explicitHeaders;
+  } else if (rowValues.length && rowValues[0].length && rowValues[0].every((c) => /^\[.*\]$/.test(c))) {
+    columns = rowValues.shift().map((c) => c.replace(/^\[|\]$/g, ''));
   }
-  return { hasResult: columns.length > 0 || rows.length > 0, columns, rows, rowCount: rows.length, error };
+
+  const rows = rowValues.slice(0, 200);
+  return {
+    hasResult: columns.length > 0 || rows.length > 0,
+    columns,
+    rows,
+    rowCount: rows.length,
+    error,
+  };
 }
 
 /** Tag a visible "Run" button in the DAX query view (aria-label/text === "Run"). Returns {found, selector}. */
