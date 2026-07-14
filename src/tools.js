@@ -770,7 +770,7 @@ export function registerTools(server) {
     'pbi_page_sweep',
     {
       description:
-        'Iterate pages (default all), goto each, wait canvas-ready (cap 30s/page), record loadMs + error scan + cards fingerprint. Restores the original page. Returns per-page array + {startedOn, restoredTo}.',
+        'HEAVY, deliberately renders every page: each page switch makes Desktop re-query all its visuals (blank/busy for that page’s real load time, often 10-30s+). Run as an intentional health sweep (≤2 pages per call; user warned/away), never casually. Iterates pages, waits canvas-ready (cap 30s/page), records loadMs + error scan + cards fingerprint; restores the original page.',
       inputSchema: {
         pages: z.array(z.string()).optional(),
         errorScan: z.boolean().optional(),
