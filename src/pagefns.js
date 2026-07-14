@@ -34,38 +34,39 @@ export function pageMetadata() {
   // thread and freezes the report. The title lives in the app title bar, a tiny
   // scoped region. Query only known title-bar containers, and read the LEAF text
   // nodes there via a shallow, bounded scan.
-  const hasBoth = (t) => /\S.*·\s*Last saved:/.test(t) && !/^·/.test(t.trim());
-  let titleBar = null;
-  // Known title-bar hosts across Desktop builds; all cheap, none touch the canvas.
+  // The title-bar container's textContent is a run-on of ALL toolbar text, e.g.
+  // "SaveUndo…Redo…R0105-Wealth Reporting· Last saved: Today at 5:09 PM  (Power
+  // BI Project)Bjorn Braet…". Don't rely on element boundaries — isolate the
+  // "<name>· Last saved: <…>(… Project)" window with a regex on the raw text.
+  // Bounded scopes only (never a canvas-wide scan — that was the freeze).
+  const hasSaved = (t) => /·\s*Last saved:/.test(t);
+  let rawTitle = null;
   const titleScopes = q(
     '[class*="titlebar" i], [class*="title-bar" i], [class*="appTitle" i], [aria-label*="Last saved" i], [title*="Last saved" i]'
   );
   for (const scope of titleScopes) {
-    // Shallow: only this scope's own text + its direct descendants' text, bounded.
     const t = (scope.textContent || '').trim();
-    if (hasBoth(t) && t.length < 300) {
-      titleBar = t;
+    if (hasSaved(t) && t.length < 600) {
+      rawTitle = t;
       break;
     }
   }
-  // Fallback: some builds expose it as the document.title.
-  if (!titleBar && hasBoth(document.title || '')) {
-    titleBar = (document.title || '').trim();
-  }
+  if (!rawTitle && hasSaved(document.title || '')) rawTitle = (document.title || '').trim();
 
   let reportName = null;
   let lastSaved = null;
-  if (titleBar) {
-    // Split on the "·" separator: left = reportName, right = "Last saved: ...".
-    const parts = titleBar.split('·');
-    reportName = (parts[0] || '').trim() || null;
-    if (parts.length > 1) {
-      lastSaved = parts
-        .slice(1)
-        .join('·')
-        .replace(/^\s*Last saved:\s*/i, '')
-        .replace(/\s*\([^)]*\)\s*$/, '') // drop trailing "(Power BI Project)"
-        .trim() || null;
+  let titleBar = null;
+  if (rawTitle) {
+    // name = the token run immediately before "·"; the toolbar words before it
+    // ("…Redo the last action you undid.") end in a period, so cut at the last
+    // sentence boundary. saved = between "Last saved:" and the "(… Project)" tag.
+    const m = rawTitle.match(/([^.·]+?)\s*·\s*Last saved:\s*(.*?)\s*\(([^)]*Project[^)]*)\)/i);
+    if (m) {
+      reportName = m[1].trim() || null;
+      lastSaved = m[2].trim() || null;
+      titleBar = `${reportName}· Last saved: ${lastSaved}  (${m[3].trim()})`;
+    } else {
+      titleBar = rawTitle.slice(0, 200);
     }
   }
 
