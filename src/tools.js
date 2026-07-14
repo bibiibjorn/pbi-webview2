@@ -1068,32 +1068,34 @@ export function registerTools(server) {
     'pbi_snapshot',
     {
       description:
-        'Accessibility-tree snapshot of the reportView page (browser_snapshot equivalent) for structure discovery when a selector drifts. Returns a compact tree of {role, name, and optionally box}. interestingOnly:true (default) prunes decorative nodes; maxDepth caps depth; filter (regex string) keeps only nodes whose role/name matches. Read-only.',
+        'Accessibility-tree snapshot of the reportView page (browser_snapshot equivalent) for structure discovery when a selector drifts. Returns the ARIA snapshot (roles + accessible names, indented) as lines. selector scopes to a sub-tree (default "body"); filter (regex string) keeps only matching lines (with their indent); maxLines caps output. Read-only.',
       inputSchema: {
-        interestingOnly: z.boolean().optional(),
-        maxDepth: z.number().int().optional(),
-        filter: z.string().optional().describe('Regex; keep only nodes whose role or name matches'),
+        selector: z.string().optional().describe('Root to snapshot; default "body"'),
+        filter: z.string().optional().describe('Regex; keep only lines whose text matches'),
+        maxLines: z.number().int().optional().describe('Cap returned lines (default 400)'),
       },
     },
-    async ({ interestingOnly = true, maxDepth = 12, filter }) =>
+    async ({ selector = 'body', filter, maxLines = 400 }) =>
       guard(() =>
         withReport(async (page) => {
-          const root = await page.accessibility.snapshot({ interestingOnly });
-          if (!root) return { connected: true, tree: null, note: 'empty a11y snapshot' };
-          let re = null;
-          if (filter) { try { re = new RegExp(filter, 'i'); } catch (e) { re = null; } }
-          const prune = (node, depth) => {
-            if (depth > maxDepth) return null;
-            const kids = (node.children || [])
-              .map((c) => prune(c, depth + 1))
-              .filter(Boolean);
-            const self = { role: node.role, name: node.name };
-            if (kids.length) self.children = kids;
-            if (re && !re.test(node.role || '') && !re.test(node.name || '') && !kids.length) return null;
-            return self;
-          };
-          const tree = prune(root, 0);
-          return { connected: true, tree };
+          // page.accessibility.snapshot() was removed in modern Playwright; the
+          // supported API is locator.ariaSnapshot() → indented role/name text.
+          let snap;
+          try {
+            snap = await page.locator(selector).first().ariaSnapshot();
+          } catch (e) {
+            return { connected: true, tree: null, error: `ariaSnapshot failed for "${selector}": ${e.message}` };
+          }
+          let lines = (snap || '').split('\n');
+          const total = lines.length;
+          if (filter) {
+            let re = null;
+            try { re = new RegExp(filter, 'i'); } catch (e) { re = null; }
+            if (re) lines = lines.filter((l) => re.test(l));
+          }
+          const truncated = lines.length > maxLines;
+          if (truncated) lines = lines.slice(0, maxLines);
+          return { connected: true, totalLines: total, returnedLines: lines.length, truncated, lines };
         })
       )
   );
