@@ -29,29 +29,28 @@ export function pageMetadata() {
   const activePage = activeTabEl ? (activeTabEl.textContent || '').trim().replace(/x$/, '') : null;
 
   // Title bar text: "R0105-Wealth Reporting· Last saved: Today at 5:09 PM (Power BI Project)".
-  // We want the SMALLEST node whose text still contains BOTH the report name AND the
-  // "· Last saved:" part — i.e. non-space content BEFORE the "·". A node whose text
-  // begins with "·" (e.g. the inner .statusContainer) has lost the report name; skip it.
+  // CRITICAL: never scan q('*') + textContent here — that is an O(n²) walk over the
+  // ENTIRE report canvas (tens of thousands of nodes) that pins the WebView2 main
+  // thread and freezes the report. The title lives in the app title bar, a tiny
+  // scoped region. Query only known title-bar containers, and read the LEAF text
+  // nodes there via a shallow, bounded scan.
   const hasBoth = (t) => /\S.*·\s*Last saved:/.test(t) && !/^·/.test(t.trim());
   let titleBar = null;
-  const savedEl = q('*').find((el) => {
-    const t = (el.textContent || '').trim();
-    return hasBoth(t) && t.length < 200;
-  });
-  if (savedEl) {
-    // Descend into children only while the child STILL contains the report name.
-    let node = savedEl;
-    const smallerChild = (n) =>
-      Array.from(n.querySelectorAll('*')).find((c) => {
-        const ct = (c.textContent || '').trim();
-        return hasBoth(ct) && ct.length < (n.textContent || '').trim().length;
-      });
-    let deeper = smallerChild(node);
-    while (deeper) {
-      node = deeper;
-      deeper = smallerChild(node);
+  // Known title-bar hosts across Desktop builds; all cheap, none touch the canvas.
+  const titleScopes = q(
+    '[class*="titlebar" i], [class*="title-bar" i], [class*="appTitle" i], [aria-label*="Last saved" i], [title*="Last saved" i]'
+  );
+  for (const scope of titleScopes) {
+    // Shallow: only this scope's own text + its direct descendants' text, bounded.
+    const t = (scope.textContent || '').trim();
+    if (hasBoth(t) && t.length < 300) {
+      titleBar = t;
+      break;
     }
-    titleBar = (node.textContent || '').trim();
+  }
+  // Fallback: some builds expose it as the document.title.
+  if (!titleBar && hasBoth(document.title || '')) {
+    titleBar = (document.title || '').trim();
   }
 
   let reportName = null;
