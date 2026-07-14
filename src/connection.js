@@ -61,7 +61,6 @@ export function reset() {
   }
   _browser = null;
   _page = null;
-  _inFlight = 0; // pending evaluates died with the connection
 }
 
 /**
@@ -116,39 +115,16 @@ const EVAL_BUDGET_MS = (() => {
   return Number.isNaN(v) ? 30000 : v; // first-touch after attach ≈8s; renders can hold the thread longer
 })();
 
-// Single-flight gate: at most ONE of our evaluates may be pending against the
-// renderer at any time. A busy canvas already has our previous evaluate queued;
-// stacking more (poll loops, concurrent tools) piles work onto the exact main
-// thread that is trying to render the visuals. Everything beyond the one
-// in-flight evaluate answers renderer-busy WITHOUT touching the page.
-let _inFlight = 0;
-let _inFlightSince = 0;
-
 function budgetedPage(page) {
   return new Proxy(page, {
     get(target, prop) {
       if (prop === 'evaluate') {
         return (fn, arg) => {
-          if (_inFlight > 0) {
-            // Self-heal: a pending evaluate older than 3x the budget is a zombie
-            // (e.g. issued into a context the load-time navigation destroyed) —
-            // the canvas can be fully idle and it still never settles. Recycle
-            // the CDP connection: the disconnect kills the zombie, withReport's
-            // disconnect handling reconnects fresh and retries the caller.
-            if (Date.now() - _inFlightSince > EVAL_BUDGET_MS * 3) {
-              reset();
-              return Promise.reject(
-                new Error('Target closed: recycled a stale pending evaluate; reconnecting')
-              );
-            }
-            return Promise.reject(
-              new Error(
-                'renderer-busy: a previous evaluate is still queued behind the rendering canvas; retry in a few seconds'
-              )
-            );
-          }
-          _inFlight += 1;
-          _inFlightSince = Date.now();
+          // A single time budget so a call can never hang forever if it lands
+          // mid-render. The page functions themselves are cheap and scoped (no
+          // canvas-wide scans — that was the real freeze, fixed in pagefns), so
+          // this is a safety net, not the primary defense. No self-heal recycle:
+          // recycling churned the connection; a plain timeout is enough.
           let t;
           const timeout = new Promise((_, reject) => {
             t = setTimeout(
@@ -162,12 +138,7 @@ function budgetedPage(page) {
               EVAL_BUDGET_MS
             );
           });
-          // The underlying evaluate keeps _inFlight held until the renderer
-          // actually answers it — even after we give up and report busy. That
-          // is the point: it stops new evaluates from stacking meanwhile.
-          const run = target.evaluate(fn, arg).finally(() => {
-            _inFlight = Math.max(0, _inFlight - 1); // reset() may already have zeroed it
-          });
+          const run = target.evaluate(fn, arg);
           run.catch(() => {}); // avoid unhandled rejection after we bail on the race
           return Promise.race([run, timeout]).finally(() => clearTimeout(t));
         };

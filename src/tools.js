@@ -9,6 +9,7 @@ import { z } from 'zod';
 import fs from 'node:fs';
 import path from 'node:path';
 import { withReport, consoleSnapshot, HINT } from './connection.js';
+import { launchDesktop } from './launch.js';
 import * as F from './pagefns.js';
 
 const OUTPUT_DIR =
@@ -118,6 +119,27 @@ async function svgAwareClick(page, selector, ctrl) {
 }
 
 export function registerTools(server) {
+  /* 0. pbi_launch --------------------------------------------------------- */
+  // Not wrapped in withReport — Desktop isn't up yet; this is what BRINGS it up.
+  server.registerTool(
+    'pbi_launch',
+    {
+      description:
+        'Launch Power BI Desktop on a .pbip WITH the CDP debug port (replaces the pbi-desktop-debug.ps1 step). Injects the WebView2 remote-debugging env var into Desktop\'s own process, spawns detached, waits until the CDP port answers. If the port is already up, reports the running instance instead of launching a second one. Pre-flight warns about orphaned PBIDesktop/msmdsrv. After it returns cdpUp:true, call pbi_wait_for {text:"<page name>"} — the canvas is still rendering.',
+      inputSchema: {
+        pbip: z.string().describe('Absolute path to the .pbip file'),
+        port: z.number().int().optional().describe('CDP port (default 9222)'),
+        waitPortMs: z
+          .number()
+          .int()
+          .optional()
+          .describe('How long to wait for the CDP port to answer (default 240000)'),
+      },
+    },
+    async ({ pbip, port, waitPortMs }) =>
+      guard(() => launchDesktop({ pbip, port, waitPortMs }))
+  );
+
   /* 1. pbi_status --------------------------------------------------------- */
   server.registerTool(
     'pbi_status',

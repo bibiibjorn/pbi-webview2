@@ -15,6 +15,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const serverPath = path.join(__dirname, '..', 'server.js');
 
 const EXPECTED_TOOLS = [
+  'pbi_launch',
   'pbi_status',
   'pbi_pages',
   'pbi_goto_page',
