@@ -1097,18 +1097,28 @@ export function readDaxResults() {
     .filter((r) => r.querySelector('[role="gridcell"]'));
   if (!rowEls.length) return { hasResult: false, error };
 
-  const rowValues = rowEls.map((r) =>
+  let rowValues = rowEls.map((r) =>
     Array.from(r.querySelectorAll('[role="gridcell"]')).map((c) => (c.textContent || '').trim())
   );
 
-  // A header row = every cell is a `[name]`-style column token (brackets), or the
-  // grid exposes explicit columnheaders. Prefer explicit headers if present anywhere.
+  // This build prefixes each row with a row-NUMBER cell: the header row looks like
+  // ["", "[col1]", "[col2]"] and data rows like ["1", "v1", "v2"]. Detect + drop that
+  // leading ordinal column when the header's first cell is blank and the rest are
+  // `[name]` tokens.
   let columns = [];
   const explicitHeaders = q('[role="columnheader"]').filter(isVisible).map((c) => (c.textContent || '').trim());
+  const isHeaderCells = (cells) => {
+    const nonEmpty = cells.filter((c) => c !== '');
+    return nonEmpty.length > 0 && nonEmpty.every((c) => /^\[.*\]$/.test(c));
+  };
   if (explicitHeaders.length) {
     columns = explicitHeaders;
-  } else if (rowValues.length && rowValues[0].length && rowValues[0].every((c) => /^\[.*\]$/.test(c))) {
-    columns = rowValues.shift().map((c) => c.replace(/^\[|\]$/g, ''));
+  } else if (rowValues.length && isHeaderCells(rowValues[0])) {
+    const headerRow = rowValues.shift();
+    // Drop a leading blank ordinal cell from the header AND every data row.
+    const dropLead = headerRow.length && headerRow[0] === '';
+    columns = (dropLead ? headerRow.slice(1) : headerRow).map((c) => c.replace(/^\[|\]$/g, ''));
+    if (dropLead) rowValues = rowValues.map((r) => r.slice(1));
   }
 
   const rows = rowValues.slice(0, 200);

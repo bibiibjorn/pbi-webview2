@@ -1465,7 +1465,7 @@ export function registerTools(server) {
     'pbi_emulate_theme',
     {
       description:
-        'Force the WebView media query prefers-color-scheme to light/dark/no-preference (via page.emulateMedia — persists on the page until reset or reload, no dangling CDP session). A report styled on prefers-color-scheme will restyle. Returns {emulated, scheme}. RESET to "no-preference" (or "light") when done so the report is left as you found it.',
+        'Force the WebView media query prefers-color-scheme to light/dark/no-preference (via page.emulateMedia). Returns {emulated, scheme}. NOTE (verified 2026-07-15): the signal flips correctly (matchMedia reflects it) but Power BI Desktop reports do NOT restyle on prefers-color-scheme — report theming is driven by theme.json + app settings, not this CSS signal — so this is effectively INERT for PBI report canvases (it would matter only for a generic web app). Kept for completeness; do not expect a visual change. RESET to "no-preference" when done.',
       inputSchema: {
         scheme: z.enum(['light', 'dark', 'no-preference']),
       },
