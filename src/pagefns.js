@@ -1030,3 +1030,150 @@ export function tagMenuItem(text) {
   el.setAttribute('data-pw', 'pw-menuitem');
   return { found: true, selector: '[data-pw="pw-menuitem"]', matchedItem: textOf(el) };
 }
+
+/* ------------------------------------------------------- monaco (dax/tmdl) */
+// NB: these run in the daxQueryView / tmdlView page targets (NOT reportView) —
+// the tool resolves the sibling CDP page and passes it to page.evaluate. Both
+// targets carry window.monaco with monaco.editor.getModels()/getEditors()
+// (Desktop 2.155, verified). getEditors()[0] is the ACTIVE editor.
+
+/** Read the Monaco editor text: prefer the active editor's model, fallback to models[0]. */
+export function readMonacoText() {
+  if (!window.monaco || !monaco.editor) return { monaco: false };
+  const editors = monaco.editor.getEditors ? monaco.editor.getEditors() : [];
+  const models = monaco.editor.getModels ? monaco.editor.getModels() : [];
+  let text = null;
+  if (editors.length && editors[0].getModel && editors[0].getModel()) {
+    text = editors[0].getModel().getValue();
+  } else if (models.length) {
+    text = models[0].getValue();
+  }
+  return { monaco: true, found: text != null, text, modelCount: models.length };
+}
+
+/** Set the active Monaco editor's model value + focus it (for the DAX run). Returns {took}. */
+export function setMonacoText(dax) {
+  if (!window.monaco || !monaco.editor) return { monaco: false, took: false };
+  const editors = monaco.editor.getEditors ? monaco.editor.getEditors() : [];
+  if (!editors.length || !editors[0].getModel || !editors[0].getModel()) {
+    return { monaco: true, took: false, reason: 'no active editor' };
+  }
+  const ed = editors[0];
+  ed.getModel().setValue(dax);
+  ed.focus();
+  return { monaco: true, took: ed.getModel().getValue() === dax };
+}
+
+/**
+ * Read the DAX query view results grid + any inline error banner. The results
+ * render in a `[role="grid"]` (ag-grid `.ag-root`); errors show inline in a
+ * message region. Caps at ~200 rows. Returns {hasResult, columns, rows, rowCount, error}.
+ */
+export function readDaxResults() {
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  const isVisible = (el) => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  // Error banner: match a visible message/error region whose text looks like a query error.
+  const errRe = /error|failed|cannot|syntax|invalid|couldn.?t/i;
+  let error = null;
+  const errScopes = q(
+    '[class*="error" i], [class*="message" i], [role="alert"], [class*="queryStatus" i]'
+  ).filter(isVisible);
+  for (const s of errScopes) {
+    const t = (s.textContent || '').trim();
+    if (t && t.length < 800 && errRe.test(t)) { error = t; break; }
+  }
+
+  // Results grid. Prefer an ag-grid; else any visible [role="grid"].
+  let grid =
+    q('.ag-root').find(isVisible) ||
+    q('[role="grid"]').find(isVisible) ||
+    null;
+  if (!grid) return { hasResult: false, error };
+
+  const columns = [];
+  const rows = [];
+  // ag-grid: headers in .ag-header-cell-text; rows in [role="row"] with [role="gridcell"].
+  const headerEls = Array.from(grid.querySelectorAll('.ag-header-cell-text'));
+  if (headerEls.length) {
+    for (const h of headerEls) columns.push((h.textContent || '').trim());
+  } else {
+    // generic grid: first row of columnheaders
+    const hr = grid.querySelector('[role="row"]');
+    if (hr) {
+      for (const c of hr.querySelectorAll('[role="columnheader"]')) columns.push((c.textContent || '').trim());
+    }
+  }
+  const rowEls = Array.from(grid.querySelectorAll('[role="row"]')).filter((r) =>
+    r.querySelector('[role="gridcell"]')
+  );
+  for (const r of rowEls) {
+    if (rows.length >= 200) break;
+    const cells = Array.from(r.querySelectorAll('[role="gridcell"]')).map((c) => (c.textContent || '').trim());
+    if (cells.length) rows.push(cells);
+  }
+  return { hasResult: columns.length > 0 || rows.length > 0, columns, rows, rowCount: rows.length, error };
+}
+
+/** Tag a visible "Run" button in the DAX query view (aria-label/text === "Run"). Returns {found, selector}. */
+export function tagDaxRunButton() {
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  const isVisible = (el) => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const cands = q('button, [role="button"], [role="menuitem"]').filter(isVisible);
+  const labelOf = (el) => ((el.getAttribute('aria-label') || '') || (el.textContent || '')).trim();
+  const el = cands.find((b) => labelOf(b) === 'Run') || cands.find((b) => /^run\b/i.test(labelOf(b)));
+  if (!el) return { found: false, selector: null };
+  document.querySelectorAll('[data-pw="pw-daxrun"]').forEach(function (e) { e.removeAttribute('data-pw'); });
+  el.setAttribute('data-pw', 'pw-daxrun');
+  return { found: true, selector: '[data-pw="pw-daxrun"]' };
+}
+
+/* ---------------------------------------------------------------- dialog */
+// Runs in the desktopDialogHost page target (only exists while a dialog shows).
+
+/**
+ * Read a Desktop dialog's visible text + button labels. The desktopDialogHost
+ * target is PERSISTENT (exists even when no dialog is up — then its body has
+ * zero height / no content), so `visible` reports whether a dialog is actually
+ * showing. Returns {visible, text, buttons}.
+ */
+export function readDialog() {
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  const isVisible = (el) => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const bodyRect = document.body ? document.body.getBoundingClientRect() : { width: 0, height: 0 };
+  const text = (document.body ? document.body.textContent || '' : '').replace(/\s+/g, ' ').trim().slice(0, 2000);
+  const buttons = q('button, [role="button"]')
+    .filter(isVisible)
+    .map((b) => ((b.getAttribute('aria-label') || '') || (b.textContent || '')).trim())
+    .filter(Boolean);
+  const visible = bodyRect.height > 0 && (text.length > 0 || buttons.length > 0);
+  return { visible, text, buttons };
+}
+
+/** Tag a dialog button by label: exact then contains (case-insensitive). Returns {found, selector, matchedLabel, buttons}. */
+export function tagDialogButton(label) {
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  const isVisible = (el) => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const btns = q('button, [role="button"]').filter(isVisible);
+  const labelOf = (b) => ((b.getAttribute('aria-label') || '') || (b.textContent || '')).trim();
+  const all = btns.map(labelOf).filter(Boolean);
+  let el =
+    btns.find((b) => labelOf(b) === label) ||
+    btns.find((b) => labelOf(b).toLowerCase() === label.toLowerCase()) ||
+    btns.find((b) => labelOf(b).toLowerCase().includes(label.toLowerCase()));
+  if (!el) return { found: false, selector: null, buttons: all };
+  document.querySelectorAll('[data-pw="pw-dialogbtn"]').forEach(function (e) { e.removeAttribute('data-pw'); });
+  el.setAttribute('data-pw', 'pw-dialogbtn');
+  return { found: true, selector: '[data-pw="pw-dialogbtn"]', matchedLabel: labelOf(el), buttons: all };
+}

@@ -69,6 +69,12 @@ server starts. When Desktop is unreachable, every tool returns a structured
 | `pbi_search_slicer` | `query`, `pick?`, `container?` | Type into a slicer search box; return filtered items; optional pick clicks the match. |
 | `pbi_context_menu` | `selector?`, `ariaLabel?`, `click?` | Right-click a data point/visual, read menu items; optional click invokes one (else Escape-closes). |
 | `pbi_screenshot` | `filename?`, `fullPage?` | Screenshot to the output dir. |
+| `pbi_read_dax_editor` | — | Read the DAX query view editor text (Monaco; reaches the `daxQueryView` CDP target). `{ok:false, reason}` if that view isn't open. |
+| `pbi_read_tmdl` | — | Read the TMDL view editor text (Monaco; reaches the `tmdlView` CDP target). `{ok:false, reason}` if that view isn't open. |
+| `pbi_dax_query` | `dax`, `timeoutMs?` | Write DAX into the query view + run (F5, Run-button fallback) + read the results grid. **OVERWRITES the editor content** (prior text not restored). |
+| `pbi_dialog` | `action:read\|click`, `button?` | Read/click a Desktop dialog (`desktopDialogHost` target, exists only while a dialog shows). Refuses to click Save unless `button` is exactly `"Save"`. |
+| `pbi_deep_snapshot` | `what:axtree\|dom\|heap`, `maxNodes?` | Raw-CDP deep inspection: compact a11y tree, DOMSnapshot size probe, or V8 heap usage. Read-only. |
+| `pbi_emulate_theme` | `scheme:light\|dark\|no-preference` | Force `prefers-color-scheme` on the WebView (persists until reset/reload). Reset when done. |
 
 ## Registration (`.claude.json` / MCP config)
 

@@ -1,5 +1,5 @@
 /**
- * Tool catalog — registers all 26 pbi-webview2 tools on the McpServer.
+ * Tool catalog — registers all 32 pbi-webview2 tools on the McpServer.
  *
  * Every tool wraps its work in withReport(fn) (lazy connect + reconnect-retry),
  * returns compact JSON via ok(), and never leaks window.powerBIAccessToken.
@@ -1251,6 +1251,230 @@ export function registerTools(server) {
           const abs = path.join(OUTPUT_DIR, fname);
           await page.screenshot({ path: abs, fullPage: !!fullPage });
           return { connected: true, path: abs };
+        })
+      )
+  );
+
+  /* 25. pbi_read_dax_editor ----------------------------------------------- */
+  server.registerTool(
+    'pbi_read_dax_editor',
+    {
+      description:
+        'Read the DAX query view editor text (Monaco). Reaches the daxQueryView CDP target (a SEPARATE page from reportView); returns {ok:false, reason} if that view has never been opened in Desktop (open it via the DAX query view tab first — this tool will NOT open ribbon views). Read-only.',
+      inputSchema: {},
+    },
+    async () =>
+      guard(() =>
+        withReport(async (page) => {
+          const daxPage = page.context().pages().find((p) => p.url().includes('daxQueryView'));
+          if (!daxPage) {
+            return { ok: false, reason: 'DAX query view not open — open it in Desktop first' };
+          }
+          const res = await daxPage.evaluate(F.readMonacoText);
+          if (!res.monaco) return { ok: true, found: false, monaco: false };
+          return { ok: true, ...res };
+        })
+      )
+  );
+
+  /* 26. pbi_read_tmdl ----------------------------------------------------- */
+  server.registerTool(
+    'pbi_read_tmdl',
+    {
+      description:
+        'Read the TMDL view editor text (Monaco). Reaches the tmdlView CDP target (a SEPARATE page from reportView); returns {ok:false, reason} if that view has never been opened in Desktop (open the TMDL view tab first — this tool will NOT open ribbon views). Read-only.',
+      inputSchema: {},
+    },
+    async () =>
+      guard(() =>
+        withReport(async (page) => {
+          const tmdlPage = page.context().pages().find((p) => p.url().includes('tmdlView'));
+          if (!tmdlPage) {
+            return { ok: false, reason: 'TMDL view not open — open it in Desktop first' };
+          }
+          const res = await tmdlPage.evaluate(F.readMonacoText);
+          if (!res.monaco) return { ok: true, found: false, monaco: false };
+          return { ok: true, ...res };
+        })
+      )
+  );
+
+  /* 27. pbi_dax_query ----------------------------------------------------- */
+  // WARNING: OVERWRITES whatever the user had in the DAX query editor. Prior text
+  // is NOT captured/restored (we cannot recover it) — document the caveat only.
+  server.registerTool(
+    'pbi_dax_query',
+    {
+      description:
+        'Write DAX into the DAX query view editor and RUN it, then read the results grid. Reaches the daxQueryView CDP target (SEPARATE from reportView); {ok:false, reason} if the view has never been opened in Desktop (open the DAX query view tab first — this tool will NOT open ribbon views). Runs via F5 on the focused editor, falling back to a visible "Run" button. Returns {ran, columns, rows, rowCount, error?}. CAVEAT: this OVERWRITES whatever DAX the user had in the query editor — prior text is NOT restored (unrecoverable). Use a throwaway query view.',
+      inputSchema: {
+        dax: z.string().describe('The DAX to run (EVALUATE …). Overwrites the editor content.'),
+        timeoutMs: z.number().int().optional().describe('How long to poll for results (default 30000)'),
+      },
+    },
+    async ({ dax, timeoutMs = 30000 }) =>
+      guard(() =>
+        withReport(async (page) => {
+          const daxPage = page.context().pages().find((p) => p.url().includes('daxQueryView'));
+          if (!daxPage) {
+            return { ok: false, reason: 'DAX query view not open — open it in Desktop first' };
+          }
+          const set = await daxPage.evaluate(F.setMonacoText, dax);
+          if (!set.monaco) return { ok: false, reason: 'no Monaco editor in the DAX query view' };
+          if (!set.took) return { ok: false, reason: `could not set editor text (${set.reason || 'unknown'})` };
+          // Run: trusted F5 on the focused editor. Focus was set by setMonacoText.
+          await daxPage.keyboard.press('F5');
+          // Poll for a results grid (or error banner) to appear.
+          let res = await poll(
+            () => daxPage.evaluate(F.readDaxResults),
+            (v) => v && (v.hasResult || v.error),
+            Math.min(timeoutMs, 6000)
+          );
+          // If nothing rendered on F5, defensively try a visible "Run" button.
+          if (!res.satisfied) {
+            const runTag = await daxPage.evaluate(F.tagDaxRunButton);
+            if (runTag.found) {
+              await robustClick(daxPage, runTag.selector, false);
+              res = await poll(
+                () => daxPage.evaluate(F.readDaxResults),
+                (v) => v && (v.hasResult || v.error),
+                timeoutMs
+              );
+            }
+          }
+          const v = res.value;
+          if (!v || (!v.hasResult && !v.error)) {
+            return { ok: true, ran: false, reason: 'no results or error rendered within timeout' };
+          }
+          if (v.error) return { ok: true, ran: true, error: v.error };
+          return { ok: true, ran: true, columns: v.columns, rows: v.rows, rowCount: v.rowCount };
+        })
+      )
+  );
+
+  /* 28. pbi_dialog -------------------------------------------------------- */
+  // SAFETY: refuses to click a button labelled /^save$/i unless the param is
+  // EXACTLY "Save" (case-sensitive) — guards against accidentally saving.
+  server.registerTool(
+    'pbi_dialog',
+    {
+      description:
+        'Automate a Desktop dialog (desktopDialogHost CDP target — exists ONLY while a dialog is showing). action:"read" returns {open, text, buttons}; action:"click" trusted-clicks the button matching `button` (exact, then case-insensitive contains). Returns {open:false, reason:"no dialog showing"} when none is up. SAFETY: a button labelled "Save" (any case) is refused UNLESS the `button` param is EXACTLY "Save" (case-sensitive) — protects against accidentally saving the report.',
+      inputSchema: {
+        action: z.enum(['read', 'click']),
+        button: z.string().optional().describe('Label to click (required for action:"click")'),
+      },
+    },
+    async ({ action, button }) =>
+      guard(() =>
+        withReport(async (page) => {
+          const dialogPage = page.context().pages().find((p) => p.url().includes('desktopDialogHost'));
+          if (!dialogPage) {
+            return { ok: false, open: false, reason: 'no dialog showing' };
+          }
+          // The desktopDialogHost target is PERSISTENT — it exists even when no
+          // dialog is up (empty, zero-height body). Treat that as "no dialog".
+          const d = await dialogPage.evaluate(F.readDialog);
+          if (!d.visible) {
+            return { ok: false, open: false, reason: 'no dialog showing' };
+          }
+          if (action === 'read') {
+            return { ok: true, open: true, text: d.text, buttons: d.buttons };
+          }
+          // click
+          if (!button) return { ok: true, open: true, clicked: false, reason: 'button param required for click' };
+          // SAFETY: never click a Save button unless the caller typed exactly "Save".
+          if (/^save$/i.test(button) && button !== 'Save') {
+            return { ok: true, open: true, clicked: false, reason: 'refused: Save must be passed EXACTLY as "Save" (case-sensitive) to click it' };
+          }
+          const tag = await dialogPage.evaluate(F.tagDialogButton, button);
+          if (!tag.found) {
+            return { ok: true, open: true, clicked: false, reason: 'button not found', buttons: tag.buttons };
+          }
+          // Guard the resolved label too: a fuzzy match must not land on Save.
+          if (/^save$/i.test(tag.matchedLabel) && button !== 'Save') {
+            return { ok: true, open: true, clicked: false, reason: 'refused: matched a Save button; pass EXACTLY "Save" to click it', buttons: tag.buttons };
+          }
+          // Trusted coordinate click.
+          const locator = dialogPage.locator(tag.selector);
+          const box = await locator.boundingBox();
+          if (!box) return { ok: true, open: true, clicked: false, reason: 'button has no bounding box' };
+          await dialogPage.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+          return { ok: true, open: true, clicked: true, clickedButton: tag.matchedLabel };
+        })
+      )
+  );
+
+  /* 29. pbi_deep_snapshot ------------------------------------------------- */
+  server.registerTool(
+    'pbi_deep_snapshot',
+    {
+      description:
+        'Raw-CDP deep inspection of the reportView page. what:"axtree" (default) = a compact {role,name} projection of the full accessibility tree (capped to maxNodes, totalNodes reported); "dom" = a DOMSnapshot size probe ({documentCount, note}); "heap" = V8 heap usage ({usedMB, totalMB}). Read-only; safe.',
+      inputSchema: {
+        what: z.enum(['axtree', 'dom', 'heap']).optional().describe('default "axtree"'),
+        maxNodes: z.number().int().optional().describe('axtree node cap (default 500)'),
+      },
+    },
+    async ({ what = 'axtree', maxNodes = 500 }) =>
+      guard(() =>
+        withReport(async (page) => {
+          const cdp = await page.context().newCDPSession(page);
+          try {
+            if (what === 'axtree') {
+              const { nodes } = await cdp.send('Accessibility.getFullAXTree');
+              const totalNodes = (nodes || []).length;
+              const compact = [];
+              for (const n of nodes || []) {
+                const role = n.role && n.role.value;
+                const name = n.name && n.name.value;
+                if (!role && !name) continue;
+                compact.push({ role: role || null, name: name || null });
+                if (compact.length >= maxNodes) break;
+              }
+              return { connected: true, what, totalNodes, returnedNodes: compact.length, nodes: compact };
+            }
+            if (what === 'dom') {
+              const snap = await cdp.send('DOMSnapshot.captureSnapshot', { computedStyles: [] });
+              const documentCount = (snap.documents || []).length;
+              let firstDocNodeCount = null;
+              const d0 = snap.documents && snap.documents[0];
+              if (d0 && d0.nodes && d0.nodes.nodeType) firstDocNodeCount = d0.nodes.nodeType.length;
+              return {
+                connected: true,
+                what,
+                documentCount,
+                firstDocNodeCount,
+                note: 'size/health probe only — full DOM snapshot not returned (too large)',
+              };
+            }
+            // heap
+            await cdp.send('HeapProfiler.enable').catch(() => {});
+            const h = await cdp.send('Runtime.getHeapUsage');
+            const round = (b) => Math.round((b / 1048576) * 10) / 10;
+            return { connected: true, what, usedMB: round(h.usedSize), totalMB: round(h.totalSize) };
+          } finally {
+            await cdp.detach().catch(() => {});
+          }
+        })
+      )
+  );
+
+  /* 30. pbi_emulate_theme ------------------------------------------------- */
+  server.registerTool(
+    'pbi_emulate_theme',
+    {
+      description:
+        'Force the WebView media query prefers-color-scheme to light/dark/no-preference (via page.emulateMedia — persists on the page until reset or reload, no dangling CDP session). A report styled on prefers-color-scheme will restyle. Returns {emulated, scheme}. RESET to "no-preference" (or "light") when done so the report is left as you found it.',
+      inputSchema: {
+        scheme: z.enum(['light', 'dark', 'no-preference']),
+      },
+    },
+    async ({ scheme }) =>
+      guard(() =>
+        withReport(async (page) => {
+          await page.emulateMedia({ colorScheme: scheme });
+          return { connected: true, emulated: true, scheme };
         })
       )
   );
