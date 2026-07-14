@@ -28,27 +28,45 @@ export function pageMetadata() {
   );
   const activePage = activeTabEl ? (activeTabEl.textContent || '').trim().replace(/x$/, '') : null;
 
-  // Title bar text: "R0105-Wealth Reporting · Last saved: Yesterday at 4:35 PM (Power BI Project)"
+  // Title bar text: "R0105-Wealth Reporting· Last saved: Today at 5:09 PM (Power BI Project)".
+  // We want the SMALLEST node whose text still contains BOTH the report name AND the
+  // "· Last saved:" part — i.e. non-space content BEFORE the "·". A node whose text
+  // begins with "·" (e.g. the inner .statusContainer) has lost the report name; skip it.
+  const hasBoth = (t) => /\S.*·\s*Last saved:/.test(t) && !/^·/.test(t.trim());
   let titleBar = null;
-  try {
-    titleBar = (document.title || '').trim() || null;
-  } catch (e) { /* ignore */ }
-  // Fall back to any title-bar-ish element if document.title is empty.
-  if (!titleBar) {
-    const tb = q('[class*="titlebar" i] , [class*="appTitle" i]')
-      .map((el) => (el.textContent || '').trim())
-      .filter(Boolean)[0];
-    titleBar = tb || null;
+  const savedEl = q('*').find((el) => {
+    const t = (el.textContent || '').trim();
+    return hasBoth(t) && t.length < 200;
+  });
+  if (savedEl) {
+    // Descend into children only while the child STILL contains the report name.
+    let node = savedEl;
+    const smallerChild = (n) =>
+      Array.from(n.querySelectorAll('*')).find((c) => {
+        const ct = (c.textContent || '').trim();
+        return hasBoth(ct) && ct.length < (n.textContent || '').trim().length;
+      });
+    let deeper = smallerChild(node);
+    while (deeper) {
+      node = deeper;
+      deeper = smallerChild(node);
+    }
+    titleBar = (node.textContent || '').trim();
   }
+
   let reportName = null;
   let lastSaved = null;
   if (titleBar) {
-    const m = titleBar.match(/^(.*?)\s*(?:·|-|–)?\s*Last saved:\s*(.*?)(?:\s*\((?:Power BI Project|.*)\))?$/i);
-    if (m) {
-      reportName = (m[1] || '').trim() || null;
-      lastSaved = (m[2] || '').trim() || null;
-    } else {
-      reportName = titleBar;
+    // Split on the "·" separator: left = reportName, right = "Last saved: ...".
+    const parts = titleBar.split('·');
+    reportName = (parts[0] || '').trim() || null;
+    if (parts.length > 1) {
+      lastSaved = parts
+        .slice(1)
+        .join('·')
+        .replace(/^\s*Last saved:\s*/i, '')
+        .replace(/\s*\([^)]*\)\s*$/, '') // drop trailing "(Power BI Project)"
+        .trim() || null;
     }
   }
 
@@ -57,11 +75,27 @@ export function pageMetadata() {
     desktopBuild = (window.powerbi && window.powerbi.build) || null;
   } catch (e) { /* ignore */ }
 
+  // Zoom: the status-bar zoom button (aria-label starts "Zoom level"); its text
+  // is the clean value like "42%". Extract with /\d+%/.
   let zoom = null;
-  const zoomEl = q('[class*="zoom" i]')
-    .map((el) => (el.textContent || '').trim())
-    .find((t) => /%/.test(t));
-  if (zoomEl) zoom = zoomEl;
+  const zoomBtn = q('[aria-label]').find((el) =>
+    /^Zoom level/i.test((el.getAttribute('aria-label') || '').trim())
+  );
+  if (zoomBtn) {
+    const m = (zoomBtn.textContent || '').match(/\d+%/);
+    if (m) zoom = m[0];
+    else {
+      const am = (zoomBtn.getAttribute('aria-label') || '').match(/\d+%/);
+      if (am) zoom = am[0];
+    }
+  }
+  if (!zoom) {
+    const zt = q('[class*="zoom" i]')
+      .map((el) => (el.textContent || ''))
+      .map((t) => (t.match(/\d+%/) || [])[0])
+      .find(Boolean);
+    if (zt) zoom = zt;
+  }
 
   const visibleVisualCount = q('.visualContainer').filter((el) => {
     const r = el.getBoundingClientRect();
@@ -117,6 +151,7 @@ export function tagPageTab(name) {
   const want = name + 'x';
   const exact = tabs.find((o) => o.txt === want);
   if (exact) {
+    document.querySelectorAll('[data-pw="pw-pagetab"]').forEach(function (e) { e.removeAttribute('data-pw'); });
     exact.el.setAttribute('data-pw', 'pw-pagetab');
     return {
       found: true,
@@ -151,9 +186,9 @@ export function stateProbe() {
         .filter((t) => t && / card$/.test(t))
     ),
   ].map((label) => {
-    // "Net Asset Value, 672,756,295 card" → {title, value}
-    const core = label.replace(/ card$/, '');
-    const idx = core.lastIndexOf(',');
+    // "Net Asset Value, 672,756,295 card" → title before FIRST comma, value = rest.
+    const core = label.replace(/ card$/, '').trim();
+    const idx = core.indexOf(',');
     if (idx > -1) {
       return { title: core.slice(0, idx).trim(), value: core.slice(idx + 1).trim() };
     }
@@ -194,8 +229,9 @@ export function readCards() {
         .filter((t) => t && / card$/.test(t))
     ),
   ].map((label) => {
-    const core = label.replace(/ card$/, '');
-    const idx = core.lastIndexOf(',');
+    // Split at the FIRST comma: title before it, value = the rest.
+    const core = label.replace(/ card$/, '').trim();
+    const idx = core.indexOf(',');
     if (idx > -1) {
       return { title: core.slice(0, idx).trim(), value: core.slice(idx + 1).trim() };
     }
@@ -216,6 +252,23 @@ export function tagForClick(arg) {
   let matches = [];
   if (selector) {
     try { matches = q(selector); } catch (e) { matches = []; }
+    // When BOTH selector AND ariaLabel are given, narrow the selector set to the
+    // element whose aria-label matches (exact, then contains) — this targets e.g.
+    // the "Real Estate" donut arc among many `path.slice` elements.
+    if (ariaLabel && matches.length) {
+      const own = (el) => (el.getAttribute && (el.getAttribute('aria-label') || '')) || '';
+      // aria-label may live on the element itself or a nearest labelled ancestor/descendant.
+      const labelText = (el) => {
+        if (own(el).trim()) return own(el);
+        const anc = el.closest && el.closest('[aria-label]');
+        if (anc && (anc.getAttribute('aria-label') || '').trim()) return anc.getAttribute('aria-label');
+        const desc = el.querySelector && el.querySelector('[aria-label]');
+        return desc ? (desc.getAttribute('aria-label') || '') : '';
+      };
+      let narrowed = matches.filter((el) => labelText(el).trim() === ariaLabel);
+      if (!narrowed.length) narrowed = matches.filter((el) => labelText(el).includes(ariaLabel));
+      if (narrowed.length) matches = narrowed;
+    }
   } else if (ariaLabel) {
     const all = q('[aria-label]');
     matches = all.filter((el) => (el.getAttribute('aria-label') || '').trim() === ariaLabel);
@@ -234,6 +287,7 @@ export function tagForClick(arg) {
   const candidateCount = matches.length;
   if (!candidateCount) return { found: false, selector: null, matchedLabel: null, candidateCount: 0 };
   const el = matches[Math.min(index || 0, matches.length - 1)];
+  document.querySelectorAll('[data-pw="pw-click"]').forEach(function (e) { e.removeAttribute('data-pw'); });
   el.setAttribute('data-pw', 'pw-click');
   return {
     found: true,
@@ -255,6 +309,7 @@ export function tagButtonSlicer(value) {
   let el = btns.find((b) => (b.textContent || '').trim() === value);
   if (!el) el = btns.find((b) => (b.textContent || '').trim().includes(value));
   if (!el) return { found: false, selector: null, pressed: null };
+  document.querySelectorAll('[data-pw="pw-slicer"]').forEach(function (e) { e.removeAttribute('data-pw'); });
   el.setAttribute('data-pw', 'pw-slicer');
   return { found: true, selector: '[data-pw="pw-slicer"]', pressed: el.getAttribute('aria-pressed') };
 }
@@ -276,6 +331,7 @@ export function tagSlicerItem(value) {
     );
   }
   if (!el) return { found: false, selector: null };
+  document.querySelectorAll('[data-pw="pw-sloiitem"]').forEach(function (e) { e.removeAttribute('data-pw'); });
   el.setAttribute('data-pw', 'pw-sloiitem');
   return { found: true, selector: '[data-pw="pw-sloiitem"]' };
 }
@@ -303,6 +359,7 @@ export function tagRibbonTab(name) {
   const q = (s) => Array.from(document.querySelectorAll(s));
   const el = q('[role="tab"]').find((t) => (t.textContent || '').trim() === name);
   if (!el) return { found: false, selector: null };
+  document.querySelectorAll('[data-pw="pw-ribbontab"]').forEach(function (e) { e.removeAttribute('data-pw'); });
   el.setAttribute('data-pw', 'pw-ribbontab');
   return { found: true, selector: '[data-pw="pw-ribbontab"]' };
 }
@@ -314,14 +371,18 @@ export function tagRibbonButton(ariaLabel) {
     (b) => (b.getAttribute('aria-label') || '').trim() === ariaLabel
   );
   if (!el) return { found: false, selector: null };
+  document.querySelectorAll('[data-pw="pw-ribbonbtn"]').forEach(function (e) { e.removeAttribute('data-pw'); });
   el.setAttribute('data-pw', 'pw-ribbonbtn');
   return { found: true, selector: '[data-pw="pw-ribbonbtn"]' };
 }
 
 /**
  * Find a bookmark leaf row by name (optionally within a group), scroll into view,
- * tag its .title. Returns {found, selector, isGroup, groupExpanded, needExpandGroup, names}.
- * If the leaf isn't rendered but a matching GROUP header exists, tag the group for expansion.
+ * tag its .title. Returns {found, selector, isGroup, needExpandGroup, groupExpanded, available}.
+ *
+ * Desktop 2.155+ puts a `.caret` node in EVERY `.dropzone.bookmark` row (leaves too),
+ * so caret-presence no longer discriminates. The reliable discriminator is
+ * `aria-expanded`: GROUP rows carry it ("true"/"false"); LEAF rows have it === null.
  */
 export function tagBookmarkRow(arg) {
   const { name, group } = arg;
@@ -329,69 +390,108 @@ export function tagBookmarkRow(arg) {
     (el) => el.getBoundingClientRect().width > 0
   );
   const titleOf = (el) => (el.querySelector('.title')?.textContent || '').trim();
-  const isGroup = (el) => !!el.querySelector('.caret');
-  const names = rows.map((el) => ({ name: titleOf(el), group: isGroup(el) }));
+  // Group rows have an aria-expanded attribute; leaf rows have it === null.
+  const expandedAttr = (el) => {
+    const own = el.getAttribute('aria-expanded');
+    if (own !== null) return own;
+    const inner = el.querySelector('[aria-expanded]');
+    return inner ? inner.getAttribute('aria-expanded') : null;
+  };
+  const isGroup = (el) => expandedAttr(el) !== null;
+  const available = rows.map((el) => ({ name: titleOf(el), isGroup: isGroup(el) }));
 
   const leaf = rows.find((el) => titleOf(el) === name && !isGroup(el));
   if (leaf) {
     leaf.scrollIntoView({ block: 'center' });
-    const t = leaf.querySelector('.title');
-    if (t) {
-      t.setAttribute('data-pw', 'pw-bmfire');
-      return { found: true, selector: '[data-pw="pw-bmfire"]', isGroup: false, names };
-    }
+    const t = leaf.querySelector('.title') || leaf;
+    document.querySelectorAll('[data-pw="pw-bmfire"]').forEach(function (e) { e.removeAttribute('data-pw'); });
+    t.setAttribute('data-pw', 'pw-bmfire');
+    return { found: true, selector: '[data-pw="pw-bmfire"]', isGroup: false, available };
   }
-  // Not found as a leaf. If a group was named, or any group exists, offer to expand.
+  // Not found as a leaf. If a group was named (or any collapsed group exists), offer to expand.
   const grp = group
     ? rows.find((el) => titleOf(el) === group && isGroup(el))
-    : rows.find((el) => isGroup(el));
+    : rows.find((el) => isGroup(el) && expandedAttr(el) === 'false');
   if (grp) {
     grp.scrollIntoView({ block: 'center' });
-    const t = grp.querySelector('.title');
-    if (t) {
-      t.setAttribute('data-pw', 'pw-bmgroup');
-      return {
-        found: false,
-        selector: null,
-        isGroup: true,
-        needExpandGroup: '[data-pw="pw-bmgroup"]',
-        groupName: titleOf(grp),
-        names,
-      };
-    }
+    const groupExpanded = expandedAttr(grp) === 'true';
+    // Tag the caret so the caller can expand ONLY when collapsed.
+    const t = grp.querySelector('.caret') || grp.querySelector('.title') || grp;
+    document.querySelectorAll('[data-pw="pw-bmgroup"]').forEach(function (e) { e.removeAttribute('data-pw'); });
+    t.setAttribute('data-pw', 'pw-bmgroup');
+    return {
+      found: false,
+      selector: null,
+      isGroup: true,
+      groupExpanded,
+      needExpandGroup: groupExpanded ? null : '[data-pw="pw-bmgroup"]',
+      groupName: titleOf(grp),
+      available,
+    };
   }
-  return { found: false, selector: null, isGroup: false, names };
+  return { found: false, selector: null, isGroup: false, available };
 }
 
 /* ----------------------------------------------------------------- matrix */
 
-/** Tag a matrix/grid by title match / index; returns {found, selector, index, titles}. */
+/**
+ * Tag a matrix/grid by title match / index; returns {found, selector, index, titles, pickedTitle}.
+ * With no titleMatch/index the DEFAULT pick is the visible grid with the largest
+ * (aria-rowcount × aria-colcount), requiring rowcount > 1 (avoids 1×1 Info-Card grids).
+ */
 export function tagMatrix(arg) {
   const { titleMatch, index } = arg;
-  const containers = Array.from(document.querySelectorAll('.visualContainer')).filter((c) =>
-    c.querySelector('[role="grid"]')
-  );
+  const containers = Array.from(document.querySelectorAll('.visualContainer')).filter((c) => {
+    if (!c.querySelector('[role="grid"]')) return false;
+    const r = c.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  });
+  const gridOf = (c) => c.querySelector('[role="grid"]');
   const titleOf = (c) => {
-    const g = c.querySelector('[role="grid"]');
+    const g = gridOf(c);
     return (
       (g && g.getAttribute('aria-label')) ||
       (c.getAttribute('aria-label') || '').trim() ||
       ''
     );
   };
+  const rowsOf = (c) => parseInt((gridOf(c) || {}).getAttribute?.('aria-rowcount') || '0', 10) || 0;
+  const colsOf = (c) => parseInt((gridOf(c) || {}).getAttribute?.('aria-colcount') || '0', 10) || 0;
   const titles = containers.map(titleOf);
   let picked = -1;
   if (titleMatch) {
     picked = containers.findIndex((c) =>
       titleOf(c).toLowerCase().includes(titleMatch.toLowerCase())
     );
+  } else if (index != null) {
+    picked = Math.min(index, containers.length - 1);
   } else {
-    picked = Math.min(index || 0, containers.length - 1);
+    // Default: largest rowcount×colcount grid with rowcount > 1.
+    let best = -1;
+    let bestArea = -1;
+    for (let i = 0; i < containers.length; i++) {
+      const rc = rowsOf(containers[i]);
+      const cc = colsOf(containers[i]);
+      if (rc <= 1) continue;
+      const area = rc * cc;
+      if (area > bestArea) {
+        bestArea = area;
+        best = i;
+      }
+    }
+    picked = best;
   }
   if (picked < 0 || !containers[picked]) return { found: false, selector: null, titles };
-  const grid = containers[picked].querySelector('[role="grid"]');
+  const grid = gridOf(containers[picked]);
+  document.querySelectorAll('[data-pw="pw-matrix"]').forEach(function (e) { e.removeAttribute('data-pw'); });
   grid.setAttribute('data-pw', 'pw-matrix');
-  return { found: true, selector: '[data-pw="pw-matrix"]', index: picked, titles };
+  return {
+    found: true,
+    selector: '[data-pw="pw-matrix"]',
+    index: picked,
+    titles,
+    pickedTitle: titleOf(containers[picked]),
+  };
 }
 
 /** Read a tagged grid ('[data-pw="pw-matrix"]') fully as JSON. */
@@ -446,22 +546,68 @@ export function taggedMatrixRowCount() {
 }
 
 /**
- * Tag the expand/collapse button of the row whose rowheader === rowHeader,
- * inside the tagged grid. Returns {found, selector, expandable}.
+ * Tag the expand/collapse button of the row whose rowheader matches rowHeader,
+ * inside the tagged grid. Row headers look like "BNK001 | Crescent Fund", so match
+ * exact first, then startsWith, then includes. Returns {found, selector, expandable, matchedHeader}.
  */
 export function tagMatrixExpander(rowHeader) {
   const grid = document.querySelector('[data-pw="pw-matrix"]');
   if (!grid) return { found: false, selector: null };
   const rows = Array.from(grid.querySelectorAll('[role="row"]'));
-  const target = rows.find((r) => {
+  const headerText = (r) => {
     const h = r.querySelector('[role="rowheader"]');
-    return h && (h.textContent || '').trim() === rowHeader;
-  });
+    return h ? (h.textContent || '').trim() : null;
+  };
+  let target =
+    rows.find((r) => headerText(r) === rowHeader) ||
+    rows.find((r) => (headerText(r) || '').startsWith(rowHeader)) ||
+    rows.find((r) => (headerText(r) || '').includes(rowHeader));
   if (!target) return { found: false, selector: null };
+  const matchedHeader = headerText(target);
   const btn = target.querySelector('.expandCollapseButton.clickable, .expandCollapseButton');
-  if (!btn) return { found: false, selector: null, expandable: false };
+  if (!btn) return { found: false, selector: null, expandable: false, matchedHeader };
+  document.querySelectorAll('[data-pw="pw-expander"]').forEach(function (e) { e.removeAttribute('data-pw'); });
   btn.setAttribute('data-pw', 'pw-expander');
-  return { found: true, selector: '[data-pw="pw-expander"]', expandable: true };
+  return { found: true, selector: '[data-pw="pw-expander"]', expandable: true, matchedHeader };
+}
+
+/* ---------------------------------------------------------- on-path click point */
+
+/**
+ * Compute a trusted click point for a tagged element. Center-of-bbox misses thin
+ * SVG arcs (e.g. a 29×32px donut slice) — the bbox center is off the stroke. When
+ * the element is an SVGGeometryElement, use the on-path midpoint transformed to
+ * screen coords. Otherwise fall back to bbox center. offsetX/offsetY are added on
+ * top of the resolved point. Returns {found, x, y, onPath}.
+ */
+export function clickPointForSelector(arg) {
+  const { selector, offsetX, offsetY } = arg;
+  const el = selector ? document.querySelector(selector) : null;
+  if (!el) return { found: false };
+  let x = null;
+  let y = null;
+  let onPath = false;
+  if (typeof el.getTotalLength === 'function') {
+    try {
+      const len = el.getTotalLength();
+      const mid = el.getPointAtLength(len / 2);
+      const ctm = el.getScreenCTM();
+      if (ctm) {
+        const sp = new DOMPoint(mid.x, mid.y).matrixTransform(ctm);
+        x = sp.x;
+        y = sp.y;
+        onPath = true;
+      }
+    } catch (e) { /* fall through to bbox */ }
+  }
+  if (x == null || y == null) {
+    const r = el.getBoundingClientRect();
+    x = r.x + r.width / 2;
+    y = r.y + r.height / 2;
+  }
+  if (offsetX != null) x += offsetX;
+  if (offsetY != null) y += offsetY;
+  return { found: true, x, y, onPath };
 }
 
 /* -------------------------------------------------------------- cross-filter */
@@ -530,6 +676,7 @@ export function tagPerfControl(kind) {
     }
   }
   if (!el) return { found: false, selector: null, paneOpen: true };
+  document.querySelectorAll('[data-pw="pw-perf-' + kind + '"]').forEach(function (e) { e.removeAttribute('data-pw'); });
   el.setAttribute('data-pw', 'pw-perf-' + kind);
   return { found: true, selector: '[data-pw="pw-perf-' + kind + '"]', paneOpen: true };
 }
@@ -572,6 +719,7 @@ export function tagPerfRow(visualName) {
   });
   if (!target) return { found: false, selector: null };
   const nc = target.querySelector('td.nameCol');
+  document.querySelectorAll('[data-pw="pw-perfrow"]').forEach(function (e) { e.removeAttribute('data-pw'); });
   nc.setAttribute('data-pw', 'pw-perfrow');
   return { found: true, selector: '[data-pw="pw-perfrow"]' };
 }
@@ -596,6 +744,7 @@ export function tagPerfCopyQuery(visualName) {
   );
   const btn = btns[0];
   if (!btn) return { found: false, selector: null };
+  document.querySelectorAll('[data-pw="pw-perfcopy"]').forEach(function (e) { e.removeAttribute('data-pw'); });
   btn.setAttribute('data-pw', 'pw-perfcopy');
   return { found: true, selector: '[data-pw="pw-perfcopy"]' };
 }
@@ -619,17 +768,27 @@ export function tagForHover(arg) {
     if (!el) el = q('[aria-label]').find((e) => (e.getAttribute('aria-label') || '').includes(ariaLabel));
   }
   if (!el) return { found: false, selector: null };
+  document.querySelectorAll('[data-pw="pw-hover"]').forEach(function (e) { e.removeAttribute('data-pw'); });
   el.setAttribute('data-pw', 'pw-hover');
   return { found: true, selector: '[data-pw="pw-hover"]' };
 }
 
-/** Read tooltip text if a tooltip container is present. */
+/**
+ * Read tooltip text from ONLY the tooltip surfaces that are VISIBLE right now
+ * (getBoundingClientRect width>0 && height>0). Desktop keeps ~40 hidden chrome
+ * tooltips mounted; reading all of them concatenated garbage. Also drop the
+ * pure-chrome labels 'Press Enter to edit', 'Page navigation', 'Bookmark'.
+ */
 export function readTooltip() {
   const q = (s) => Array.from(document.querySelectorAll(s));
-  const els = q('.tooltip-container, [role="tooltip"]');
-  const txt = els
+  const drop = new Set(['Press Enter to edit', 'Page navigation', 'Bookmark']);
+  const txt = q('.tooltip-container, [role="tooltip"]')
+    .filter((e) => {
+      const r = e.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    })
     .map((e) => (e.textContent || '').trim())
-    .filter(Boolean)
+    .filter((t) => t && !drop.has(t))
     .join(' | ');
   return txt || null;
 }

@@ -24,6 +24,19 @@ function ok(result) {
   return { content: [{ type: 'text', text: JSON.stringify(result) }] };
 }
 
+/**
+ * Run a tool body with a catch-ALL guard: any thrown error (not just disconnects)
+ * becomes a structured {ok:false, error} result instead of a raw MCP throw that
+ * loses every partial context. Use as: return await guard(() => withReport(...)).
+ */
+async function guard(fn) {
+  try {
+    return ok(await fn());
+  } catch (e) {
+    return ok({ ok: false, error: String((e && e.message) || e) });
+  }
+}
+
 /** Short poll: run probe() until predicate(v) is true or timeout; returns {value, elapsedMs, satisfied}. */
 async function poll(probe, predicate, timeoutMs, intervalMs = 200) {
   const start = Date.now();
@@ -63,6 +76,28 @@ async function robustClick(page, selector, ctrl) {
   }
 }
 
+/**
+ * Click a tagged element, preferring an on-path point for thin SVG geometry
+ * (donut arcs, thin bars) where a locator/bbox-center click is a NO-OP. Computes
+ * the on-path screen point in the page and fires a trusted mouse.click there.
+ * Falls back to robustClick for non-SVG targets. Returns {clicked, method, clickedAt}.
+ */
+async function svgAwareClick(page, selector, ctrl) {
+  const pt = await page.evaluate(F.clickPointForSelector, { selector });
+  if (pt && pt.found && pt.onPath) {
+    const modifiers = ctrl ? ['Control'] : [];
+    if (ctrl) await page.keyboard.down('Control');
+    try {
+      await page.mouse.click(pt.x, pt.y);
+    } finally {
+      if (ctrl) await page.keyboard.up('Control');
+    }
+    return { clicked: true, method: 'svg-path', clickedAt: { x: pt.x, y: pt.y } };
+  }
+  const r = await robustClick(page, selector, ctrl);
+  return { ...r, clickedAt: pt && pt.found ? { x: pt.x, y: pt.y } : null };
+}
+
 export function registerTools(server) {
   /* 1. pbi_status --------------------------------------------------------- */
   server.registerTool(
@@ -73,8 +108,8 @@ export function registerTools(server) {
       inputSchema: {},
     },
     async () =>
-      ok(
-        await withReport(async (page) => {
+      guard(() =>
+        withReport(async (page) => {
           const meta = await page.evaluate(F.pageMetadata);
           return { connected: true, ...meta };
         })
@@ -86,8 +121,8 @@ export function registerTools(server) {
     'pbi_pages',
     { description: 'List all report page tabs as [{name, active}].', inputSchema: {} },
     async () =>
-      ok(
-        await withReport(async (page) => {
+      guard(() =>
+        withReport(async (page) => {
           const pages = await page.evaluate(F.listPages);
           return { connected: true, pages };
         })
@@ -103,19 +138,33 @@ export function registerTools(server) {
       inputSchema: { name: z.string().describe('Exact page display name') },
     },
     async ({ name }) =>
-      ok(
-        await withReport(async (page) => {
+      guard(() =>
+        withReport(async (page) => {
           const tag = await page.evaluate(F.tagPageTab, name);
           if (!tag.found) {
             return { connected: true, navigated: false, reason: 'not-found', candidates: tag.candidates };
           }
           await robustClick(page, tag.selector, false);
+          // Wait for the tab to switch AND the canvas to render its visuals — not just
+          // aria-selected. Downstream reads (matrix/cross-filter) hit an empty canvas
+          // otherwise. Poll pageMetadata for activePage + canvasReady + a visual painted.
           const res = await poll(
-            () => page.evaluate(F.activePageName),
-            (v) => v === name,
-            5000
+            () => page.evaluate(F.pageMetadata),
+            (v) => v && v.activePage === name && v.canvasReady && v.visibleVisualCount > 0,
+            8000,
+            250
           );
-          return { connected: true, navigated: res.satisfied, activePage: res.value, elapsedMs: res.elapsedMs };
+          // Small settle so late-binding visuals (grids, SVG series) finish painting.
+          if (res.satisfied) await new Promise((r) => setTimeout(r, 700));
+          const meta = res.value || {};
+          return {
+            connected: true,
+            navigated: meta.activePage === name,
+            activePage: meta.activePage,
+            canvasReady: !!meta.canvasReady,
+            visibleVisualCount: meta.visibleVisualCount,
+            elapsedMs: res.elapsedMs,
+          };
         })
       )
   );
@@ -129,8 +178,8 @@ export function registerTools(server) {
       inputSchema: {},
     },
     async () =>
-      ok(
-        await withReport(async (page) => {
+      guard(() =>
+        withReport(async (page) => {
           const before = await page.evaluate(F.stateProbe);
           const original = before.activePage;
           const pages = await page.evaluate(F.listPages);
@@ -170,8 +219,8 @@ export function registerTools(server) {
       inputSchema: {},
     },
     async () =>
-      ok(
-        await withReport(async (page) => {
+      guard(() =>
+        withReport(async (page) => {
           const s = await page.evaluate(F.stateProbe);
           return { connected: true, ...s };
         })
@@ -183,8 +232,8 @@ export function registerTools(server) {
     'pbi_read_cards',
     { description: 'Parsed card visuals as [{title, value}].', inputSchema: {} },
     async () =>
-      ok(
-        await withReport(async (page) => {
+      guard(() =>
+        withReport(async (page) => {
           const cards = await page.evaluate(F.readCards);
           return { connected: true, cards };
         })
@@ -203,11 +252,12 @@ export function registerTools(server) {
         selector: z.string().optional(),
         ctrl: z.boolean().optional(),
         index: z.number().int().optional(),
+        report_selection: z.boolean().optional(),
       },
     },
     async (args) =>
-      ok(
-        await withReport(async (page) => {
+      guard(() =>
+        withReport(async (page) => {
           const tag = await page.evaluate(F.tagForClick, {
             text: args.text,
             ariaLabel: args.ariaLabel,
@@ -217,14 +267,23 @@ export function registerTools(server) {
           if (!tag.found) {
             return { connected: true, clicked: false, candidateCount: 0, reason: 'no-match' };
           }
-          const r = await robustClick(page, tag.selector, !!args.ctrl);
-          return {
+          // SVG-aware: on-path click for thin geometry (donut arcs); locator otherwise.
+          const r = await svgAwareClick(page, tag.selector, !!args.ctrl);
+          const out = {
             connected: true,
             clicked: r.clicked,
             method: r.method,
+            clickedAt: r.clickedAt,
             matchedLabel: tag.matchedLabel,
             candidateCount: tag.candidateCount,
           };
+          const reportSel = args.report_selection !== false; // default true
+          if (reportSel) {
+            out.selectedAfter = await page.evaluate(
+              () => document.querySelectorAll('.transformElement.selected, .visualContainerHost.selected').length
+            );
+          }
+          return out;
         })
       )
   );
@@ -241,8 +300,8 @@ export function registerTools(server) {
       },
     },
     async ({ value, kind }) =>
-      ok(
-        await withReport(async (page) => {
+      guard(() =>
+        withReport(async (page) => {
           if (kind === 'button') {
             const tag = await page.evaluate(F.tagButtonSlicer, value);
             if (!tag.found) return { connected: true, clicked: false, reason: 'not-found' };
@@ -290,9 +349,10 @@ export function registerTools(server) {
       },
     },
     async ({ name, group, expectPage }) =>
-      ok(
-        await withReport(async (page) => {
+      guard(() =>
+        withReport(async (page) => {
           let warning;
+          let openedPane = false;
           // Ensure Bookmarks pane is open (View ribbon tab -> Bookmarks button).
           const paneOpen = await page.evaluate(F.bookmarksPaneOpen);
           if (!paneOpen) {
@@ -307,50 +367,59 @@ export function registerTools(server) {
             }
             await robustClick(page, btn.selector, false);
             await poll(() => page.evaluate(F.bookmarksPaneOpen), (v) => v === true, 4000);
+            openedPane = true;
           }
 
-          // Locate the leaf; expand group first if needed.
-          let tag = await page.evaluate(F.tagBookmarkRow, { name, group });
-          if (!tag.found && tag.needExpandGroup) {
-            await robustClick(page, tag.needExpandGroup, false);
-            await new Promise((r) => setTimeout(r, 400));
-            tag = await page.evaluate(F.tagBookmarkRow, { name, group });
-          }
-          if (!tag.found) {
-            return {
-              connected: true,
-              fired: false,
-              reason: 'bookmark leaf not found',
-              availableNames: (tag.names || []).map((n) => n.name),
-            };
-          }
+          // Always restore chrome (close the pane if we opened it, return to Home)
+          // even on the failure path — the pane used to be left open on not-found.
+          const restoreChrome = async () => {
+            try {
+              if (openedPane) {
+                const btnClose = await page.evaluate(F.tagRibbonButton, 'Bookmarks');
+                if (btnClose.found) await robustClick(page, btnClose.selector, false);
+              }
+              const home = await page.evaluate(F.tagRibbonTab, 'Home');
+              if (home.found) await robustClick(page, home.selector, false);
+            } catch (e) { /* best-effort restore */ }
+          };
 
-          // Trusted coordinate click on the .title (synthetic clicks are ignored).
-          const locator = page.locator(tag.selector);
-          const box = await locator.boundingBox();
-          if (!box) return { connected: true, fired: false, reason: 'row has no bounding box (virtualized?)' };
-          await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+          try {
+            // Locate the leaf; expand its group first ONLY if it is collapsed.
+            let tag = await page.evaluate(F.tagBookmarkRow, { name, group });
+            if (!tag.found && tag.needExpandGroup) {
+              await robustClick(page, tag.needExpandGroup, false);
+              await new Promise((r) => setTimeout(r, 400));
+              tag = await page.evaluate(F.tagBookmarkRow, { name, group });
+            }
+            if (!tag.found) {
+              return {
+                connected: true,
+                fired: false,
+                reason: 'bookmark leaf not found',
+                available: tag.available || [],
+              };
+            }
 
-          const res = await poll(
-            () => page.evaluate(F.activePageName),
-            () => true,
-            2500,
-            250
-          );
-          const landedPage = res.value;
-          if (expectPage && landedPage !== expectPage) {
-            warning = `expected page "${expectPage}" but landed on "${landedPage}"`;
+            // Trusted coordinate click on the .title (synthetic clicks are ignored).
+            const locator = page.locator(tag.selector);
+            const box = await locator.boundingBox();
+            if (!box) return { connected: true, fired: false, reason: 'row has no bounding box (virtualized?)' };
+            await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+
+            const res = await poll(
+              () => page.evaluate(F.activePageName),
+              () => true,
+              2500,
+              250
+            );
+            const landedPage = res.value;
+            if (expectPage && landedPage !== expectPage) {
+              warning = `expected page "${expectPage}" but landed on "${landedPage}"`;
+            }
+            return { connected: true, fired: true, landedPage, warning };
+          } finally {
+            await restoreChrome();
           }
-
-          // Close the pane again and return ribbon to Home.
-          const btnClose = await page.evaluate(F.tagRibbonButton, 'Bookmarks');
-          if (btnClose.found) {
-            await robustClick(page, btnClose.selector, false);
-          }
-          const home = await page.evaluate(F.tagRibbonTab, 'Home');
-          if (home.found) await robustClick(page, home.selector, false);
-
-          return { connected: true, fired: true, landedPage, warning };
         })
       )
   );
@@ -367,8 +436,8 @@ export function registerTools(server) {
       },
     },
     async ({ titleMatch, index }) =>
-      ok(
-        await withReport(async (page) => {
+      guard(() =>
+        withReport(async (page) => {
           const tag = await page.evaluate(F.tagMatrix, { titleMatch, index });
           if (!tag.found)
             return { connected: true, found: false, reason: 'no matrix matched', titles: tag.titles };
@@ -397,7 +466,7 @@ export function registerTools(server) {
               complete: byHeader.size >= (data.ariaRowCount || 0),
             };
           }
-          return { connected: true, ...data, titleIndex: tag.index };
+          return { connected: true, ...data, titleIndex: tag.index, pickedTitle: tag.pickedTitle, titles: tag.titles };
         })
       )
   );
@@ -415,9 +484,10 @@ export function registerTools(server) {
       },
     },
     async ({ rowHeader, titleMatch, collapse }) =>
-      ok(
-        await withReport(async (page) => {
-          const tag = await page.evaluate(F.tagMatrix, { titleMatch, index: 0 });
+      guard(() =>
+        withReport(async (page) => {
+          // No titleMatch => default biggest-grid pick (F4); else match by title.
+          const tag = await page.evaluate(F.tagMatrix, { titleMatch });
           if (!tag.found) return { connected: true, found: false, reason: 'no matrix matched' };
           const rowsBefore = await page.evaluate(F.taggedMatrixRowCount);
           const exp = await page.evaluate(F.tagMatrixExpander, rowHeader);
@@ -437,6 +507,7 @@ export function registerTools(server) {
           return {
             connected: true,
             action: collapse ? 'collapse' : 'expand',
+            matchedHeader: exp.matchedHeader,
             rowsBefore,
             rowsAfter: res.value,
             changed: res.satisfied,
@@ -458,13 +529,15 @@ export function registerTools(server) {
       },
     },
     async ({ ariaLabel, selector, restore = true }) =>
-      ok(
-        await withReport(async (page) => {
+      guard(() =>
+        withReport(async (page) => {
           const tag = await page.evaluate(F.tagForClick, { ariaLabel, selector });
           if (!tag.found) return { connected: true, fired: false, reason: 'target not found' };
+          const matchedLabel = tag.matchedLabel;
           const before = await page.evaluate(F.crossFilterProbe);
           const cardsBefore = await page.evaluate(F.readCards);
-          await robustClick(page, tag.selector, false);
+          // SVG-aware: on-path click for thin arcs/bars (bbox center misses them).
+          const clickRes = await svgAwareClick(page, tag.selector, false);
           const res = await poll(
             () => page.evaluate(F.crossFilterProbe),
             (v) => v.highlights > before.highlights || v.fingerprint !== before.fingerprint,
@@ -482,10 +555,10 @@ export function registerTools(server) {
           }
           let restored;
           if (restore && fired) {
-            // Re-tag (repaint) and click again to deselect.
+            // Re-tag (repaint) and click the same on-path point again to deselect.
             const rtag = await page.evaluate(F.tagForClick, { ariaLabel, selector });
             if (rtag.found) {
-              await robustClick(page, rtag.selector, false);
+              await svgAwareClick(page, rtag.selector, false);
               const rres = await poll(
                 () => page.evaluate(F.crossFilterProbe),
                 (v) => v.fingerprint === before.fingerprint,
@@ -498,6 +571,9 @@ export function registerTools(server) {
           return {
             connected: true,
             fired,
+            matchedLabel,
+            clickedAt: clickRes.clickedAt,
+            method: clickRes.method,
             highlightsBefore: before.highlights,
             highlightsAfter: after.highlights,
             changedCards,
@@ -521,19 +597,22 @@ export function registerTools(server) {
       },
     },
     async ({ selector, ariaLabel, offsetX, offsetY }) =>
-      ok(
-        await withReport(async (page) => {
+      guard(() =>
+        withReport(async (page) => {
           const tag = await page.evaluate(F.tagForHover, { selector, ariaLabel });
           if (!tag.found) return { connected: true, tooltipText: null, reason: 'target not found' };
-          const box = await page.locator(tag.selector).boundingBox();
-          if (!box) return { connected: true, tooltipText: null, reason: 'no bounding box' };
-          const px = box.x + (offsetX != null ? offsetX : box.width / 2);
-          const py = box.y + (offsetY != null ? offsetY : box.height / 2);
-          await page.mouse.move(px, py);
+          // On-path point for SVG geometry (falls back to bbox center); offsets on top.
+          const pt = await page.evaluate(F.clickPointForSelector, {
+            selector: tag.selector,
+            offsetX,
+            offsetY,
+          });
+          if (!pt || !pt.found) return { connected: true, tooltipText: null, reason: 'no bounding box' };
+          await page.mouse.move(pt.x, pt.y);
           const res = await poll(
             () => page.evaluate(F.readTooltip),
             (v) => v != null,
-            2000,
+            2500,
             200
           );
           // Move to a neutral corner after.
@@ -552,8 +631,8 @@ export function registerTools(server) {
       inputSchema: {},
     },
     async () =>
-      ok(
-        await withReport(async (page) => {
+      guard(() =>
+        withReport(async (page) => {
           const scan = await page.evaluate(F.scanBrokenVisuals);
           const cs = consoleSnapshot();
           return {
@@ -576,8 +655,8 @@ export function registerTools(server) {
       inputSchema: { captureQueryFor: z.string().optional() },
     },
     async ({ captureQueryFor }) =>
-      ok(
-        await withReport(async (page) => {
+      guard(() =>
+        withReport(async (page) => {
           // Open Optimize ribbon tab -> Performance analyzer button.
           const opt = await page.evaluate(F.tagRibbonTab, 'Optimize');
           if (opt.found) {
@@ -667,45 +746,55 @@ export function registerTools(server) {
       },
     },
     async ({ pages, errorScan = true }) =>
-      ok(
-        await withReport(async (page) => {
+      guard(() =>
+        withReport(async (page) => {
           const all = await page.evaluate(F.listPages);
           const startedOn = (all.find((p) => p.active) || {}).name || null;
           const targets = pages && pages.length ? pages : all.map((p) => p.name);
           const results = [];
-          for (const name of targets) {
-            const tag = await page.evaluate(F.tagPageTab, name);
-            if (!tag.found) {
-              results.push({ page: name, navigated: false, reason: 'not-found' });
-              continue;
-            }
-            const t0 = Date.now();
-            await robustClick(page, tag.selector, false);
-            const ready = await poll(
-              () => page.evaluate(F.pageMetadata),
-              (v) => v.activePage === name && v.canvasReady,
-              30000,
-              300
-            );
-            const loadMs = Date.now() - t0;
-            const entry = { page: name, navigated: ready.value.activePage === name, loadMs, canvasReady: ready.value.canvasReady };
-            if (errorScan) {
-              const scan = await page.evaluate(F.scanBrokenVisuals);
-              entry.brokenVisuals = scan.brokenVisuals;
-              entry.visibleVisualCount = scan.visibleVisualCount;
-            }
-            const cards = await page.evaluate(F.readCards);
-            entry.cardsFingerprint = cards.map((c) => `${c.title}=${c.value}`).join('|');
-            results.push(entry);
-          }
-          // Restore original page.
           let restoredTo = startedOn;
-          if (startedOn) {
-            const bt = await page.evaluate(F.tagPageTab, startedOn);
-            if (bt.found) {
-              await robustClick(page, bt.selector, false);
-              await poll(() => page.evaluate(F.activePageName), (v) => v === startedOn, 15000, 300);
-              restoredTo = await page.evaluate(F.activePageName);
+          try {
+            for (const name of targets) {
+              // Per-page guard: a failed page records {page, error} and the sweep continues.
+              try {
+                const tag = await page.evaluate(F.tagPageTab, name);
+                if (!tag.found) {
+                  results.push({ page: name, navigated: false, reason: 'not-found' });
+                  continue;
+                }
+                const t0 = Date.now();
+                await robustClick(page, tag.selector, false);
+                const ready = await poll(
+                  () => page.evaluate(F.pageMetadata),
+                  (v) => v.activePage === name && v.canvasReady,
+                  30000,
+                  300
+                );
+                const loadMs = Date.now() - t0;
+                const entry = { page: name, navigated: ready.value.activePage === name, loadMs, canvasReady: ready.value.canvasReady };
+                if (errorScan) {
+                  const scan = await page.evaluate(F.scanBrokenVisuals);
+                  entry.brokenVisuals = scan.brokenVisuals;
+                  entry.visibleVisualCount = scan.visibleVisualCount;
+                }
+                const cards = await page.evaluate(F.readCards);
+                entry.cardsFingerprint = cards.map((c) => `${c.title}=${c.value}`).join('|');
+                results.push(entry);
+              } catch (e) {
+                results.push({ page: name, error: String((e && e.message) || e) });
+              }
+            }
+          } finally {
+            // Always restore the starting page.
+            if (startedOn) {
+              try {
+                const bt = await page.evaluate(F.tagPageTab, startedOn);
+                if (bt.found) {
+                  await robustClick(page, bt.selector, false);
+                  await poll(() => page.evaluate(F.activePageName), (v) => v === startedOn, 15000, 300);
+                  restoredTo = await page.evaluate(F.activePageName);
+                }
+              } catch (e) { /* best-effort restore */ }
             }
           }
           return { connected: true, pages: results, startedOn, restoredTo };
@@ -736,8 +825,8 @@ export function registerTools(server) {
       }
       if (!name) return ok({ connected: false, error: 'name is required for capture/compare' });
 
-      return ok(
-        await withReport(async (page) => {
+      return guard(() =>
+        withReport(async (page) => {
           const all = await page.evaluate(F.listPages);
           const original = (all.find((p) => p.active) || {}).name || null;
           const wantAll = pages && pages.length === 1 && pages[0] === '*';
@@ -833,8 +922,8 @@ export function registerTools(server) {
       },
     },
     async ({ text, textGone, timeoutMs = 8000 }) =>
-      ok(
-        await withReport(async (page) => {
+      guard(() =>
+        withReport(async (page) => {
           const res = await poll(
             () => page.evaluate(F.bodyText),
             (body) => {
@@ -860,14 +949,14 @@ export function registerTools(server) {
     },
     async ({ js }) => {
       if (/powerBIAccessToken/i.test(js)) {
+        // Policy refusal — NOT a connectivity failure, so no connected:false.
         return ok({
-          connected: false,
           rejected: true,
           error: 'Refused: code references powerBIAccessToken (token access is forbidden).',
         });
       }
-      return ok(
-        await withReport(async (page) => {
+      return guard(() =>
+        withReport(async (page) => {
           // Support both a bare expression/function-body and an arrow/function string.
           const trimmed = js.trim();
           const looksLikeFn = /^\s*(\(|async\s|function\b)/.test(trimmed) || /=>/.test(trimmed);
@@ -902,8 +991,8 @@ export function registerTools(server) {
       },
     },
     async ({ filename, fullPage }) =>
-      ok(
-        await withReport(async (page) => {
+      guard(() =>
+        withReport(async (page) => {
           ensureDir(OUTPUT_DIR);
           const fname = (filename || `shot-${Date.now()}.png`).replace(/[\\/]/g, '_');
           const abs = path.join(OUTPUT_DIR, fname);
