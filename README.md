@@ -71,7 +71,7 @@ server starts. When Desktop is unreachable, every tool returns a structured
   "mcpServers": {
     "pbi-webview2": {
       "command": "node",
-      "args": ["C:/Users/bjorn.braet/.claude/scripts/pbi-mcp/server.js"],
+      "args": ["C:/Users/bjorn.braet/powerbi-mcp-servers/MCP-PBI-WebView2/server.js"],
       "env": { "PBI_CDP_ENDPOINT": "http://127.0.0.1:9222" }
     }
   }
