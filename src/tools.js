@@ -956,6 +956,7 @@ export function registerTools(server) {
           const res = await poll(
             () => page.evaluate(F.bodyText),
             (body) => {
+              if (typeof body !== 'string') return false; // busy probe yielded nothing this tick
               if (text && !body.includes(text)) return false;
               if (textGone && body.includes(textGone)) return false;
               return true;

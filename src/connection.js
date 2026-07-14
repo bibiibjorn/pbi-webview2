@@ -113,6 +113,7 @@ const EVAL_BUDGET_MS = (() => {
 // thread that is trying to render the visuals. Everything beyond the one
 // in-flight evaluate answers renderer-busy WITHOUT touching the page.
 let _inFlight = 0;
+let _inFlightSince = 0;
 
 function budgetedPage(page) {
   return new Proxy(page, {
@@ -120,6 +121,17 @@ function budgetedPage(page) {
       if (prop === 'evaluate') {
         return (fn, arg) => {
           if (_inFlight > 0) {
+            // Self-heal: a pending evaluate older than 3x the budget is a zombie
+            // (e.g. issued into a context the load-time navigation destroyed) —
+            // the canvas can be fully idle and it still never settles. Recycle
+            // the CDP connection: the disconnect kills the zombie, withReport's
+            // disconnect handling reconnects fresh and retries the caller.
+            if (Date.now() - _inFlightSince > EVAL_BUDGET_MS * 3) {
+              reset();
+              return Promise.reject(
+                new Error('Target closed: recycled a stale pending evaluate; reconnecting')
+              );
+            }
             return Promise.reject(
               new Error(
                 'renderer-busy: a previous evaluate is still queued behind the rendering canvas; retry in a few seconds'
@@ -127,6 +139,7 @@ function budgetedPage(page) {
             );
           }
           _inFlight += 1;
+          _inFlightSince = Date.now();
           let t;
           const timeout = new Promise((_, reject) => {
             t = setTimeout(
@@ -144,7 +157,7 @@ function budgetedPage(page) {
           // actually answers it — even after we give up and report busy. That
           // is the point: it stops new evaluates from stacking meanwhile.
           const run = target.evaluate(fn, arg).finally(() => {
-            _inFlight -= 1;
+            _inFlight = Math.max(0, _inFlight - 1); // reset() may already have zeroed it
           });
           run.catch(() => {}); // avoid unhandled rejection after we bail on the race
           return Promise.race([run, timeout]).finally(() => clearTimeout(t));
