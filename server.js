@@ -11,7 +11,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { registerTools } from './src/tools.js';
 
 const server = new McpServer(
-  { name: 'pbi-webview2', version: '1.0.0' },
+  { name: 'pbi-webview2', version: '1.1.0' },
   {
     instructions:
       'Drives the LIVE Power BI Desktop report canvas over CDP (WebView2). ' +

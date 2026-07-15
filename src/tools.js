@@ -1,16 +1,21 @@
 /**
- * Tool catalog — registers all 33 pbi-webview2 tools on the McpServer.
+ * Tool catalog — registers all 37 pbi-webview2 tools on the McpServer.
  *
  * Every tool wraps its work in withReport(fn) (lazy connect + reconnect-retry),
  * returns compact JSON via ok(), and never leaks window.powerBIAccessToken.
  * All DOM logic lives in ../src/pagefns.js (single source; passed to page.evaluate).
+ *
+ * SAFETY INVARIANT: no tool saves, closes, reloads, or discards as a SIDE EFFECT.
+ * pbi_save/pbi_close/pbi_reload act ONLY when their explicit guard flag is passed
+ * (confirm / discardChanges / saveFirst) — without it they return a refusal object
+ * ({ok:true, <action>:false, reason}), never a throw and never the action.
  */
 import { z } from 'zod';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { withReport, consoleSnapshot, HINT } from './connection.js';
-import { launchDesktop } from './launch.js';
+import { withReport, consoleSnapshot, reset, HINT } from './connection.js';
+import { launchDesktop, findDesktopPid, killDesktop } from './launch.js';
 import * as F from './pagefns.js';
 
 const OUTPUT_DIR =
@@ -39,8 +44,19 @@ async function guard(fn) {
   }
 }
 
-/** Short poll: run probe() until predicate(v) is true or timeout; returns {value, elapsedMs, satisfied}. */
-async function poll(probe, predicate, timeoutMs, intervalMs = 1000) {
+/**
+ * Short poll: run probe() until predicate(v) is true or timeout; returns
+ * {value, elapsedMs, satisfied}.
+ *
+ * Adaptive ramp: the first sleep is `firstIntervalMs` (default 250ms) and each
+ * subsequent sleep RAMPS 1.5× toward `intervalMs` (the configured tick), so a
+ * warm/ready page can satisfy in ~250ms-1s instead of always waiting a full
+ * fixed tick, while a cold page still backs off to the steady interval. This is
+ * backward-compatible: existing callers pass only (probe, predicate, timeoutMs)
+ * and get the same steady-state interval, just reached faster on warm pages.
+ * PBI_POLL_MS overrides the steady interval (and caps the first interval).
+ */
+async function poll(probe, predicate, timeoutMs, intervalMs = 1000, firstIntervalMs = 250) {
   const start = Date.now();
   const effectiveInterval = (() => {
     if (process.env.PBI_POLL_MS) {
@@ -49,6 +65,8 @@ async function poll(probe, predicate, timeoutMs, intervalMs = 1000) {
     }
     return intervalMs;
   })();
+  // First interval never exceeds the steady interval (honours a small PBI_POLL_MS).
+  let wait = Math.min(firstIntervalMs, effectiveInterval);
   // A probe hitting a busy renderer rejects with "renderer-busy" (see
   // budgetedPage). Inside a poll that just means "not ready yet" — swallow it
   // and keep looping until the caller's timeout.
@@ -60,10 +78,11 @@ async function poll(probe, predicate, timeoutMs, intervalMs = 1000) {
       throw e;
     }
   };
-  await new Promise((r) => setTimeout(r, 500));
+  await new Promise((r) => setTimeout(r, wait));
   let value = await tryProbe();
   while (!predicate(value) && Date.now() - start < timeoutMs) {
-    await new Promise((r) => setTimeout(r, effectiveInterval));
+    wait = Math.min(Math.round(wait * 1.5), effectiveInterval);
+    await new Promise((r) => setTimeout(r, wait));
     value = await tryProbe();
   }
   return { value, elapsedMs: Date.now() - start, satisfied: predicate(value) };
@@ -146,12 +165,21 @@ export function registerTools(server) {
     'pbi_status',
     {
       description:
-        'Connect to Power BI Desktop over CDP and report status: build, title bar, active page, page count, zoom, canvasReady. Returns {connected:false,...} if unreachable.',
-      inputSchema: {},
+        'Connect to Power BI Desktop over CDP and report status: build, title bar, active page, page count, zoom, canvasReady, dirty. Returns {connected:false,...} if unreachable. light:true returns ONLY {connected, activePage, canvasReady, visibleVisualCount} via a cheap probe (skips the title-bar/zoom scan) — the agentic loop\'s hot-path status.',
+      inputSchema: {
+        light: z
+          .boolean()
+          .optional()
+          .describe('Cheap probe: only {activePage, canvasReady, visibleVisualCount}; skips title/zoom scan'),
+      },
     },
-    async () =>
+    async ({ light }) =>
       guard(() =>
         withReport(async (page) => {
+          if (light) {
+            const meta = await page.evaluate(F.pageMetadataLight);
+            return { connected: true, ...meta };
+          }
           const meta = await page.evaluate(F.pageMetadata);
           return { connected: true, ...meta };
         })
@@ -213,8 +241,23 @@ export function registerTools(server) {
             (v) => v && v.activePage === name && v.canvasReady && v.visibleVisualCount > 0,
             30000
           );
-          // Small settle so late-binding visuals (grids, SVG series) finish painting.
-          if (res.satisfied) await new Promise((r) => setTimeout(r, 700));
+          // Small settle so late-binding visuals (grids, SVG series) finish
+          // painting. Only pay it if the canvas ISN'T already stable: re-probe
+          // once and, if the visible-visual count already matches (nothing still
+          // binding), skip the settle so warm pages return sooner. Tunable via
+          // PBI_SETTLE_MS (default 700; 0 disables).
+          const settleMs = (() => {
+            const v = parseInt(process.env.PBI_SETTLE_MS || '', 10);
+            return Number.isNaN(v) ? 700 : v;
+          })();
+          if (res.satisfied && settleMs > 0) {
+            const stableNow = await page.evaluate(F.pageMetadataLight);
+            const alreadyStable =
+              stableNow &&
+              stableNow.canvasReady &&
+              stableNow.visibleVisualCount === (res.value && res.value.visibleVisualCount);
+            if (!alreadyStable) await new Promise((r) => setTimeout(r, settleMs));
+          }
           const meta = res.value || {};
           return {
             connected: true,
@@ -1512,6 +1555,286 @@ export function registerTools(server) {
         withReport(async (page) => {
           await page.emulateMedia({ colorScheme: scheme });
           return { connected: true, emulated: true, scheme };
+        })
+      )
+  );
+
+  /* ---------------------------------------------------------------------- */
+  /* v1.1.0 agentic-loop tools: save / close / reload / health.            */
+  /* Every state-changing action here is GUARDED by an explicit flag — see  */
+  /* the SAFETY INVARIANT at the top of this file.                          */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Shared save sequence (used by pbi_save {confirm} and pbi_reload {saveFirst}).
+   * Sends a TRUSTED Ctrl+S, handles the first-save "Save" dialog if it appears
+   * (the exact-"Save" guard is satisfied deliberately here — this IS a save), and
+   * verifies by lastSaved changing OR the dirty marker clearing. Returns
+   * {saved, lastSavedBefore, lastSavedAfter, verified, dialogHandled}. Assumes the
+   * caller already confirmed intent — it does NOT re-check a confirm flag.
+   */
+  async function doSave(page) {
+    const before = await page.evaluate(F.pageMetadata);
+    const lastSavedBefore = before.lastSaved || null;
+    const dirtyBefore = before.dirty;
+    // Trusted Ctrl+S on the report page (synthetic key events are ignored by
+    // Desktop — page.keyboard is the trusted OS-level path).
+    await page.keyboard.press('Control+S');
+    // A save dialog MAY appear (first save / Save As) in the desktopDialogHost
+    // target. Reuse the sibling-page lookup + dialog machinery from pbi_dialog.
+    let dialogHandled = false;
+    const dlgPoll = await poll(
+      () => {
+        const dp = page.context().pages().find((p) => p.url().includes('desktopDialogHost'));
+        if (!dp) return false;
+        return dp.evaluate(F.readDialog).then((d) => d && d.visible);
+      },
+      (v) => v === true,
+      3000
+    );
+    if (dlgPoll.satisfied) {
+      const dp = page.context().pages().find((p) => p.url().includes('desktopDialogHost'));
+      if (dp) {
+        const tag = await dp.evaluate(F.tagDialogButton, 'Save');
+        // Deliberate save: the exact-"Save" guard is intentionally satisfied.
+        if (tag.found && /^save$/i.test(tag.matchedLabel)) {
+          const locator = dp.locator(tag.selector);
+          const box = await locator.boundingBox();
+          if (box) {
+            await dp.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+            dialogHandled = true;
+          }
+        }
+      }
+    }
+    // Verify: lastSaved changed OR dirty cleared (PBIP save flips both).
+    const verifyPoll = await poll(
+      () => page.evaluate(F.pageMetadata),
+      (v) =>
+        v &&
+        ((lastSavedBefore != null && v.lastSaved != null && v.lastSaved !== lastSavedBefore) ||
+          (dirtyBefore !== false && v.dirty === false)),
+      8000
+    );
+    const after = verifyPoll.value || {};
+    const lastSavedAfter = after.lastSaved || null;
+    const verified =
+      (lastSavedBefore != null && lastSavedAfter != null && lastSavedAfter !== lastSavedBefore) ||
+      (dirtyBefore !== false && after.dirty === false);
+    return { saved: true, lastSavedBefore, lastSavedAfter, verified, dialogHandled };
+  }
+
+  /* 31. pbi_save ---------------------------------------------------------- */
+  server.registerTool(
+    'pbi_save',
+    {
+      description:
+        'Save the report — GUARDED. Without confirm:true it REFUSES ({saved:false, reason}) and does nothing, because every test click mutates unsaved in-memory state and saving is opt-in. With confirm:true: sends a trusted Ctrl+S, handles the first-save "Save" dialog if it appears (deliberate save — the exact-"Save" guard is satisfied on purpose), and verifies via lastSaved changing OR the dirty marker clearing. Returns {saved, lastSavedBefore, lastSavedAfter, verified, dialogHandled}. Deselect/clear/restore slicers BEFORE saving so you do not persist test-click state.',
+      inputSchema: {
+        confirm: z.boolean().optional().describe('Must be true to actually save; otherwise refused'),
+      },
+    },
+    async ({ confirm }) => {
+      if (confirm !== true) {
+        return ok({
+          ok: true,
+          saved: false,
+          reason:
+            'pass confirm:true to save — every test click mutates unsaved in-memory state, so saving is opt-in. Deselect/clear/restore BEFORE saving.',
+        });
+      }
+      return guard(() =>
+        withReport(async (page) => {
+          const r = await doSave(page);
+          return { ok: true, ...r };
+        })
+      );
+    }
+  );
+
+  /* 32. pbi_close --------------------------------------------------------- */
+  server.registerTool(
+    'pbi_close',
+    {
+      description:
+        'Close (TERMINATE) the Power BI Desktop process tree — GUARDED by explicit intent. ALWAYS requires discardChanges:true, because Power BI Desktop does NOT expose an unsaved/dirty state over CDP (it lives in the native WPF shell, not the WebView DOM), so this tool CANNOT tell whether you have unsaved edits — it will not guess and terminate. Save first via pbi_save {confirm:true} if you want to keep changes, THEN pass discardChanges:true to close. With the flag: discovers the PBIDesktop PID that owns the CDP port, taskkills the tree (/T also ends msmdsrv + WebView2 children), and resets the cached CDP connection. This ENDS the process — it is not a detach. Returns {closed, discarded, killedPid, method}.',
+      inputSchema: {
+        discardChanges: z
+          .boolean()
+          .optional()
+          .describe('REQUIRED (true) to close — dirty state is undetectable over CDP, so closing always needs explicit intent. Save via pbi_save {confirm:true} first to keep changes.'),
+      },
+    },
+    async ({ discardChanges }) =>
+      guard(() =>
+        withReport(async (page) => {
+          // Dirty state is NOT detectable over CDP (native WPF shell, not the
+          // WebView DOM). We cannot know if there are unsaved edits, so we NEVER
+          // terminate without explicit intent — discardChanges:true is mandatory.
+          // The caller saves first (pbi_save {confirm:true}) if they want to keep
+          // work, then passes discardChanges to acknowledge the close is deliberate.
+          if (!discardChanges) {
+            return {
+              ok: true,
+              closed: false,
+              reason:
+                'intent required — Power BI Desktop does not expose unsaved/dirty state over CDP, so this tool cannot tell if you have unsaved edits. Save via pbi_save {confirm:true} if you want to keep changes, then pass discardChanges:true to close.',
+            };
+          }
+          // Discover the PBIDesktop PID that owns the CDP port and kill the tree.
+          // NB: connection.js reset() (CDP browser.close) only DETACHES the CDP
+          // session — it does NOT close Desktop — so we must taskkill the process.
+          const port = (() => {
+            const m = /:(\d+)(?:\/|$)/.exec(process.env.PBI_CDP_ENDPOINT || 'http://127.0.0.1:9222');
+            return m ? parseInt(m[1], 10) : 9222;
+          })();
+          const pids = findDesktopPid(port);
+          const targetPid = pids.pbiPid || pids.portOwnerPid || null;
+          if (!targetPid) {
+            return { ok: true, closed: false, reason: 'could not resolve a PID owning the CDP port' };
+          }
+          const kill = killDesktop(targetPid);
+          // Drop the cached CDP handles now that the process is gone.
+          reset();
+          return {
+            ok: true,
+            closed: !!kill.killed,
+            discarded: true,
+            killedPid: kill.pid,
+            method: kill.method,
+          };
+        })
+      )
+  );
+
+  /* 33. pbi_reload -------------------------------------------------------- */
+  server.registerTool(
+    'pbi_reload',
+    {
+      description:
+        'Repaint the report visuals so in-model edits (measure/format changes) re-render — GUARDED by explicit intent. Requires saveFirst:true OR discardChanges:true, because Power BI Desktop does NOT expose an unsaved/dirty state over CDP (it lives in the native WPF shell, not the WebView DOM — so this tool CANNOT detect whether you have unsaved edits, and will not guess). saveFirst:true saves (pbi_save sequence) first and aborts if the save fails verification; discardChanges:true repaints without saving. Mechanism: re-navigates the current page (neighbour-page-and-back), which makes Desktop RE-QUERY the visuals FROM THE ALREADY-LOADED MODEL — it does NOT press Refresh and does NOT reload data from the sources (no database hit). Note re-navigation clears transient selection/highlight state. Returns {reloaded, savedFirst, canvasReady, elapsedMs, repaintedPage}. This is a VISUAL repaint only — a data refresh from sources, or a full file-reopen to pick up TMDL/TOM schema edits, is deliberately OUT OF SCOPE; drive those via your desktop bridge / the Refresh button yourself.',
+      inputSchema: {
+        saveFirst: z.boolean().optional().describe('Save (pbi_save sequence) before repainting'),
+        discardChanges: z
+          .boolean()
+          .optional()
+          .describe('Repaint without saving (required if saveFirst is not set — dirty state is undetectable over CDP)'),
+        waitReadyMs: z
+          .number()
+          .int()
+          .optional()
+          .describe('How long to wait for the canvas to repaint (default 60000)'),
+      },
+    },
+    async ({ saveFirst, discardChanges, waitReadyMs = 60000 }) =>
+      guard(() =>
+        withReport(async (page) => {
+          // Dirty state is NOT detectable over CDP (native WPF shell, not the
+          // WebView DOM). So we cannot gate on "is it dirty?" — we gate on the
+          // caller's stated INTENT instead: they must pass saveFirst OR discard.
+          if (!saveFirst && !discardChanges) {
+            return {
+              ok: true,
+              reloaded: false,
+              reason:
+                'intent required — Power BI Desktop does not expose unsaved/dirty state over CDP, so this tool cannot tell if you have unsaved edits. Pass saveFirst:true to save then repaint, or discardChanges:true to repaint without saving (re-navigation also clears selection/highlight state).',
+            };
+          }
+          let savedResult = null;
+          if (saveFirst) {
+            savedResult = await doSave(page);
+            if (!savedResult.verified) {
+              // Do not reload over an unverified save — return the save result.
+              return { ok: true, reloaded: false, save: savedResult, reason: 'save not verified — reload aborted' };
+            }
+          }
+          const t0 = Date.now();
+          // Repaint mechanism: re-navigate the current page (leave to a neighbour
+          // tab and back). Switching pages makes Desktop RE-QUERY that page's
+          // visuals FROM THE LOADED MODEL — the same repaint an in-model measure/
+          // format edit needs — WITHOUT pressing the Home→Refresh button (which
+          // reloads DATA from the sources and can hit the database). This is the
+          // same neighbour-page-and-back trick pbi_deselect uses; it never touches
+          // data sources. If there is no neighbour page to bounce off, be HONEST
+          // and return reloaded:false rather than faking a repaint.
+          const startPage = (await page.evaluate(F.activePageName)) || meta.activePage || null;
+          const pages = await page.evaluate(F.listPages);
+          const neighbour = (pages || []).find((p) => p.name !== startPage);
+          if (!startPage || !neighbour) {
+            return {
+              ok: true,
+              reloaded: false,
+              savedFirst: !!saveFirst,
+              save: savedResult,
+              reason:
+                'no neighbour page to re-navigate for a repaint (single-page report?) — switch pages manually or drive a data refresh via your desktop bridge',
+            };
+          }
+          const nt = await page.evaluate(F.tagPageTab, neighbour.name);
+          if (nt.found) await robustClick(page, nt.selector, false);
+          await poll(() => page.evaluate(F.activePageName), (v) => v === neighbour.name, 6000);
+          const bt = await page.evaluate(F.tagPageTab, startPage);
+          if (bt.found) await robustClick(page, bt.selector, false);
+          // Poll canvas-ready up to waitReadyMs: the return-nav re-queries the
+          // page's visuals; the canvas goes busy then repaints.
+          const ready = await poll(
+            () => page.evaluate(F.pageMetadataLight),
+            (v) => v && v.activePage === startPage && v.canvasReady && v.visibleVisualCount > 0,
+            waitReadyMs,
+            1000
+          );
+          return {
+            ok: true,
+            reloaded: true,
+            savedFirst: !!saveFirst,
+            save: savedResult,
+            repaintedPage: (ready.value && ready.value.activePage) || startPage,
+            canvasReady: !!(ready.value && ready.value.canvasReady),
+            elapsedMs: Date.now() - t0,
+          };
+        })
+      )
+  );
+
+  /* 34. pbi_health -------------------------------------------------------- */
+  server.registerTool(
+    'pbi_health',
+    {
+      description:
+        'CHEAP aggregate "is everything OK?" probe for the agentic loop: {connected, activePage, canvasReady, visibleVisualCount, brokenVisualCount, consoleErrorCount, dirty, heapUsedMB?}. Composes pageMetadataLight + a dirty read + the broken-visual scan (count only) + the console-error count. heapUsedMB is included ONLY when heap:true (one cheap CDP Runtime.getHeapUsage). No heavy scans / no page switches.',
+      inputSchema: {
+        heap: z.boolean().optional().describe('Also report V8 heapUsedMB (one extra CDP call)'),
+      },
+    },
+    async ({ heap }) =>
+      guard(() =>
+        withReport(async (page) => {
+          const light = await page.evaluate(F.pageMetadataLight);
+          // dirty comes from the full pageMetadata title-bar read (the only place
+          // the marker is derivable). Kept as a single scoped read — still cheap.
+          const meta = await page.evaluate(F.pageMetadata);
+          const scan = await page.evaluate(F.scanBrokenVisuals);
+          const cs = consoleSnapshot();
+          const out = {
+            connected: true,
+            activePage: light.activePage,
+            canvasReady: light.canvasReady,
+            visibleVisualCount: light.visibleVisualCount,
+            brokenVisualCount: scan.brokenVisuals.length,
+            consoleErrorCount: cs.errors.length,
+            dirty: meta.dirty,
+          };
+          if (heap) {
+            const cdp = await page.context().newCDPSession(page);
+            try {
+              await cdp.send('HeapProfiler.enable').catch(() => {});
+              const h = await cdp.send('Runtime.getHeapUsage');
+              out.heapUsedMB = Math.round((h.usedSize / 1048576) * 10) / 10;
+            } finally {
+              await cdp.detach().catch(() => {});
+            }
+          }
+          return out;
         })
       )
   );

@@ -1,6 +1,6 @@
 {
   "name": "pbi-webview2",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "description": "MCP server that drives the LIVE Power BI Desktop report canvas (WebView2) over CDP — switch pages, click slicers, fire bookmarks, read cards/matrices as data, judge cross-filters, run the Performance Analyzer, and screenshot, with no reload and no OCR.",
   "license": "MIT",

@@ -80,6 +80,71 @@ function resolveLauncher(pbip) {
   return null;
 }
 
+/**
+ * Discover the PBIDesktop.exe process behind the CDP port so pbi_close can kill
+ * the RIGHT instance (never a blind kill-by-name, which would take down other
+ * Desktops). Strategy:
+ *   1. Get-NetTCPConnection → the PID that OWNS the listening CDP port. That PID
+ *      is a msedgewebview2 child of PBIDesktop (WebView2 hosts the debug port).
+ *   2. Walk ParentProcessId via Get-CimInstance Win32_Process up the chain until
+ *      a process named PBIDesktop.exe — that ancestor is the instance to kill.
+ * Returns { pbiPid, portOwnerPid } when the ancestor is found, or
+ * { portOwnerPid } only if the walk fails (caller taskkills the owner tree with
+ * /T as a fallback). All-null on total failure.
+ *
+ * Synchronous (spawnSync) — pbi_close is a deliberate, one-shot teardown.
+ */
+export function findDesktopPid(port = 9222) {
+  const ps = (script) => {
+    const r = spawnSync(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', script],
+      { windowsHide: true, encoding: 'utf8' }
+    );
+    return r.status === 0 && r.stdout ? r.stdout.trim() : '';
+  };
+
+  // 1. Port owner PID.
+  const ownerOut = ps(
+    `(Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | ` +
+      `Select-Object -ExpandProperty OwningProcess -First 1)`
+  );
+  const portOwnerPid = parseInt(ownerOut, 10);
+  if (Number.isNaN(portOwnerPid)) return {};
+
+  // 2. Walk parents to the PBIDesktop.exe ancestor (cap the walk defensively).
+  let cur = portOwnerPid;
+  for (let i = 0; i < 12 && cur; i++) {
+    const infoOut = ps(
+      `$p = Get-CimInstance Win32_Process -Filter "ProcessId=${cur}" -ErrorAction SilentlyContinue; ` +
+        `if ($p) { "$($p.Name)|$($p.ParentProcessId)" }`
+    );
+    if (!infoOut) break;
+    const [name, parentStr] = infoOut.split('|');
+    if ((name || '').toLowerCase() === 'pbidesktop.exe') {
+      return { pbiPid: cur, portOwnerPid };
+    }
+    const parent = parseInt(parentStr, 10);
+    if (Number.isNaN(parent) || parent === cur) break;
+    cur = parent;
+  }
+  // Ancestor walk failed — return the owner only (caller kills its tree with /T).
+  return { portOwnerPid };
+}
+
+/**
+ * Terminate a process tree by PID. /T kills children (WebView2, msmdsrv) too;
+ * /F forces it. Returns { killed, pid, method }.
+ */
+export function killDesktop(pid) {
+  if (!pid) return { killed: false, pid: null, method: 'taskkill' };
+  const r = spawnSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
+    windowsHide: true,
+    encoding: 'utf8',
+  });
+  return { killed: r.status === 0, pid, method: 'taskkill /T /F' };
+}
+
 async function portUp(port, timeoutMs) {
   const start = Date.now();
   const url = `http://${CDP_HOST}:${port}/json/version`;
@@ -175,11 +240,17 @@ export async function launchDesktop({ pbip, port = 9222, waitPortMs = 240000, sk
     };
   }
 
-  // Spawn detached so Desktop outlives this tool call; inject the CDP env var
-  // into the CHILD environment (the whole point — the shell env of this server
-  // process is irrelevant; PBIDesktop reads it from its own launch env).
+  // Spawn so Desktop outlives this tool call, injecting the CDP env var into the
+  // CHILD environment (the whole point — the shell env of this server process is
+  // irrelevant; PBIDesktop reads it from its own launch env).
+  //
+  // IMPORTANT — do NOT use detached:true on Windows. detached gives the child its
+  // OWN console window, which OVERRIDES windowsHide:true and makes the cmd.exe
+  // wrapper (bridge-path/.cmd launcher) flash a visible black console. PBIDesktop
+  // is a GUI app that reparents to the OS on its own, so unref() alone is enough
+  // to let it outlive us — and with windowsHide:true + stdio:'ignore' and no
+  // detached console, nothing is shown. (verified: cmd flash on detached:true.)
   const child = spawn(launcher.spawnCmd, launcher.spawnArgs, {
-    detached: true,
     stdio: 'ignore',
     windowsHide: true,
     env: {

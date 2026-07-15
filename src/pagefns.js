@@ -100,6 +100,18 @@ export function pageMetadata() {
   const visibleVisualCount = q('.visualContainer').length;
   const canvasReady = tabs.length > 0 && visibleVisualCount > 0;
 
+  // Dirty state is NOT detectable over CDP. VERIFIED (2026-07-15, Desktop 2.155):
+  // a real definition edit (select a visual, nudge it 1px with ArrowRight) changes
+  // NOTHING reachable from any WebView target — the "· Last saved: …" title-bar
+  // segment does NOT drop, no "*" appears anywhere across all 6 CDP targets
+  // (reportView/modelView/daxQueryView/tmdlView/dataExploreView/desktopDialogHost),
+  // the Save button is ALWAYS enabled, and window.powerbi exposes no isDirty /
+  // hasUnsavedChanges. The dirty flag + real title bar live in the native WPF host
+  // shell, which CDP cannot see. So report dirty:null (UNKNOWN) — never a false
+  // "clean". Destructive tools (pbi_close/pbi_reload) gate on the caller's explicit
+  // intent flag, NOT on this value.
+  const dirty = null;
+
   return {
     titleBar,
     reportName,
@@ -110,7 +122,29 @@ export function pageMetadata() {
     zoom,
     canvasReady,
     visibleVisualCount,
+    dirty,
   };
+}
+
+/**
+ * CHEAP metadata for the agentic hot loop: ONLY {activePage, canvasReady,
+ * visibleVisualCount}. Same tab / visualContainer logic as pageMetadata but
+ * SKIPS the title-bar regex scan and the zoom lookup entirely (those walk extra
+ * scoped regions and are the bulk of pageMetadata's cost). Use for pbi_status
+ * {light:true} and pbi_health where the title/zoom/build aren't needed.
+ */
+export function pageMetadataLight() {
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  const tabs = q('[role="tab"]')
+    .map((t) => (t.textContent || '').trim())
+    .filter((t) => t.endsWith('x'));
+  const activeTabEl = q('[role="tab"][aria-selected="true"]').find((t) =>
+    (t.textContent || '').trim().endsWith('x')
+  );
+  const activePage = activeTabEl ? (activeTabEl.textContent || '').trim().replace(/x$/, '') : null;
+  const visibleVisualCount = q('.visualContainer').length;
+  const canvasReady = tabs.length > 0 && visibleVisualCount > 0;
+  return { activePage, canvasReady, visibleVisualCount };
 }
 
 /* -------------------------------------------------------------------- pages */

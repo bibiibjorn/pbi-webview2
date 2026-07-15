@@ -107,7 +107,8 @@ memory and makes both render as if frozen).
 | `PBI_DESKTOP_EXE` | — | Explicit path to `PBIDesktop.exe` for the direct-launch fallback (used when no bridge CLI is found). |
 | `PBI_OUTPUT_DIR` | `<os tmpdir>/pbi-webview2-output` | Where screenshots + baselines are written (never the repo/CWD). |
 | `PBI_EVAL_BUDGET_MS` | `30000` | Per-`page.evaluate` time budget; a read that lands mid-render fails fast with a `renderer-busy` error instead of hanging. |
-| `PBI_POLL_MS` | `1000` | Interval between poll probes inside the multi-step tools. |
+| `PBI_POLL_MS` | `1000` | Steady interval between poll probes inside the multi-step tools. Polls ramp adaptively from ~250ms toward this value, so warm/ready pages satisfy fast. |
+| `PBI_SETTLE_MS` | `700` | Post-navigation settle in `pbi_goto_page` (waitReady) for late-binding visuals; only paid when the canvas isn't already stable. `0` disables it. |
 
 ### How `pbi_launch` resolves a launcher
 
@@ -128,15 +129,17 @@ resolves, `pbi_launch` returns `{launched:false, error, hint}` telling you to
 
 ## Tools
 
-33 tools. Each returns a leading status key: the **`connected:`** family reports CDP
+37 tools. Each returns a leading status key: the **`connected:`** family reports CDP
 reachability of the report canvas (`{connected:false, ...}` when Desktop is
-unreachable); the **`ok:`** family covers escape hatches and the separate DAX/TMDL/dialog
-CDP targets (`{ok:false, reason}` when that specific surface isn't available).
+unreachable); the **`ok:`** family covers escape hatches, the separate DAX/TMDL/dialog
+CDP targets, and the guarded save/close/reload tools (`{ok:false, reason}` — or a
+`{ok:true, <action>:false, reason}` refusal — when a surface isn't available or a guard
+flag wasn't passed).
 
 | Tool | Status | Key params | What it does |
 |---|---|---|---|
 | `pbi_launch` | `launched:` | `pbip`, `port?`, `waitPortMs?` | Launch Desktop WITH the CDP port (bridge-env → bridge-path → direct `PBIDesktop.exe`); injects the WebView2 debug env var; pre-flight warns about orphaned PBIDesktop/msmdsrv; reports the running instance if the port is already up. After `cdpUp:true`, call `pbi_wait_for`. |
-| `pbi_status` | `connected:` | — | Connect + report build, title bar, active page, page count, zoom, canvasReady. |
+| `pbi_status` | `connected:` | `light?` | Connect + report build, title bar, active page, page count, zoom, canvasReady, dirty. `light:true` returns only `{activePage, canvasReady, visibleVisualCount}` (cheap hot-path probe; skips the title/zoom scan). |
 | `pbi_pages` | `connected:` | — | All page tabs `[{name, active}]`. |
 | `pbi_goto_page` | `connected:` | `name`, `waitReady?` | Exact-match page nav; verifies `aria-selected`; returns candidates on miss. |
 | `pbi_deselect` | `connected:` | — | Clear selection via the neighbour-page-and-back trick (never blind-clicks the canvas). |
@@ -168,6 +171,51 @@ CDP targets (`{ok:false, reason}` when that specific surface isn't available).
 | `pbi_dialog` | `ok:` | `action:read\|click`, `button?` | Read/click a Desktop dialog (`desktopDialogHost` target, exists only while a dialog shows). Refuses to click Save unless `button` is exactly `"Save"`. |
 | `pbi_deep_snapshot` | `connected:` | `what:axtree\|dom\|heap`, `maxNodes?` | Raw-CDP deep inspection: compact a11y tree, DOMSnapshot size probe, or V8 heap usage. Read-only. |
 | `pbi_emulate_theme` | `connected:` | `scheme:light\|dark\|no-preference` | Forces `prefers-color-scheme` on the WebView. **INERT for PBI report canvases** (verified 2026-07-15): the media query flips but Desktop does not restyle — report theming is theme.json + app settings, not this CSS signal. Kept for completeness; reset when done. |
+| `pbi_save` | `ok:` | `confirm?` | **GUARDED save.** Without `confirm:true` → refuses (`{saved:false, reason}`), does nothing. With `confirm:true` → trusted Ctrl+S, handles the first-save "Save" dialog, verifies via lastSaved change / dirty clear. Deselect/restore BEFORE saving. |
+| `pbi_close` | `ok:` | `discardChanges?` | **GUARDED process kill — always needs `discardChanges:true`** (dirty state is undetectable over CDP; see note below). Save via `pbi_save {confirm:true}` first to keep changes. With the flag: discovers the PBIDesktop PID owning the CDP port and taskkills the tree (`/T` ends msmdsrv + WebView2 too), then resets the CDP connection. This TERMINATES Desktop — not a detach. |
+| `pbi_reload` | `ok:` | `saveFirst?`, `discardChanges?`, `waitReadyMs?` | **GUARDED visual repaint — needs `saveFirst:true` OR `discardChanges:true`** (dirty state is undetectable over CDP). `saveFirst` saves (and aborts on unverified save). Mechanism: re-navigates the current page (neighbour-and-back) so Desktop re-queries the visuals **from the loaded model** — it does **not** press Refresh and does **not** reload data from the sources (no database hit); re-nav clears transient selection. A data refresh from sources, or a full file-reopen for TMDL/TOM schema edits, is out of scope — drive those yourself. |
+| `pbi_health` | `connected:` | `heap?` | CHEAP aggregate: `{activePage, canvasReady, visibleVisualCount, brokenVisualCount, consoleErrorCount, dirty, heapUsedMB?}`. The loop's "is everything OK?" probe. `heapUsedMB` only when `heap:true`. **`dirty` is always `null`** — see the dirty-state note below. |
+
+> **Dirty state is not detectable over CDP.** Verified against Desktop 2.155: a real
+> report edit changes nothing reachable from any WebView target (no title-bar change, no
+> `*`, Save button always enabled, no `window.powerbi.isDirty`). Power BI Desktop's dirty
+> flag lives in its native WPF host shell, which CDP cannot see. So `pbi_save`/`pbi_close`/
+> `pbi_reload` never *detect* unsaved work — they gate on **your explicit intent flag**
+> (`confirm` / `discardChanges` / `saveFirst`). This is deliberate: a guard that silently
+> under-reports "clean" would be more dangerous than one that always asks you to state intent.
+
+## Cost tiers
+
+A loop should poll the **CHEAP** tools; call **HEAVY** tools only intentionally.
+
+| Tier | Latency (warm) | Tools |
+|---|---|---|
+| **CHEAP** | sub-second | `pbi_status {light}`, `pbi_pages`, `pbi_state_probe`, `pbi_read_cards`, `pbi_scan_errors`, `pbi_visuals`, `pbi_health`, `pbi_snapshot`, `pbi_deep_snapshot` (heap), `pbi_read_dax_editor`, `pbi_read_tmdl`, `pbi_dialog` (read), `pbi_wait_for` (warm) |
+| **MEDIUM** | ~1-5s (click + poll) | `pbi_click`, `pbi_set_slicer`, `pbi_goto_page`, `pbi_deselect`, `pbi_hover_tooltip`, `pbi_context_menu`, `pbi_fire_bookmark`, `pbi_read_matrix`, `pbi_matrix_expand`, `pbi_search_slicer`, `pbi_type`, `pbi_screenshot`, `pbi_dax_query`, `pbi_save`, `pbi_reload` |
+| **HEAVY** | ~10-45s+ (deliberate) | `pbi_perf_analyzer`, `pbi_page_sweep`, `pbi_cross_filter_test` (repaints), `pbi_baseline` (`pages:["*"]` = all pages), `pbi_close` (process kill), `pbi_launch` |
+
+## Agentic loop
+
+The canonical **safe** act → observe → judge loop. Every state-changing step is behind an
+explicit guard flag — the loop only passes `confirm` / `saveFirst` / `discardChanges` when
+the edit is legitimate, so a test-click loop can never persist garbage or lose work.
+
+```
+pbi_launch → pbi_wait_for
+  → (edit via your model/authoring MCP)
+  → pbi_reload {saveFirst:true}          # repaint visuals from the loaded model (guarded; no data refresh)
+  → pbi_health                            # cheap: broken visuals? console errors? (dirty is always null — undetectable)
+  → pbi_read_cards / pbi_read_matrix / pbi_screenshot
+  → judge → fix → repeat
+  → (restore slicers/selection: pbi_deselect / CLEAR bookmark)
+  → pbi_save {confirm:true}               # opt-in save
+  → pbi_close {discardChanges:true}       # deliberate teardown at the very end (flag always required)
+```
+
+Between iterations, observe with `pbi_health` and `pbi_status {light:true}` (both CHEAP).
+**Restore slicers/selection BEFORE `pbi_save {confirm:true}`** so you don't persist
+test-click state. `pbi_save`, `pbi_close`, and `pbi_reload` NEVER act without their guard
+flag — without it they return a refusal object, not the action.
 
 ## Safety & etiquette
 
@@ -215,10 +263,10 @@ only detaches the CDP session, it doesn't terminate the process.
 npm test   # smoke test — passes WITHOUT Desktop running (asserts connected:false)
 ```
 
-The smoke test spawns `node server.js`, speaks MCP over stdio, asserts all 33 tools are
-registered, then calls `pbi_status` and asserts it returns `{connected:false, error,
-hint}` (Desktop not running). It points the CDP endpoint at a dead port so the connect
-fails fast — no Desktop required.
+The smoke test spawns `node server.js`, speaks MCP over stdio, asserts all 37 tools are
+registered (exact-count assertion), then calls `pbi_status` and asserts it returns
+`{connected:false, error, hint}` (Desktop not running). It points the CDP endpoint at a
+dead port so the connect fails fast — no Desktop required.
 
 ## License
 
