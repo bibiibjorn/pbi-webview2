@@ -1778,3 +1778,184 @@ export function readFilterCards() {
     };
   });
 }
+
+/* ------------------------------------------------------- matrix row header */
+
+/**
+ * Tag a [role="rowheader"] inside the tagged matrix ('[data-pw="pw-matrix"]')
+ * whose text matches `text` (exact first, then startsWith, then contains). The
+ * caller MUST have run tagMatrix first to set pw-matrix. Used by pbi_expand_all
+ * to right-click a specific row's header for the Expand/Collapse context menu.
+ * Tags it `data-pw="pw-rowhdr"`. Returns {found, selector, matched}.
+ */
+export function tagRowHeaderByText(text) {
+  const grid = document.querySelector('[data-pw="pw-matrix"]');
+  if (!grid) return { found: false, selector: null };
+  const headers = Array.from(grid.querySelectorAll('[role="rowheader"]')).filter((el) => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  });
+  const textOf = (el) => (el.textContent || '').trim();
+  let el =
+    headers.find((h) => textOf(h) === text) ||
+    headers.find((h) => textOf(h).startsWith(text)) ||
+    headers.find((h) => textOf(h).includes(text));
+  if (!el) return { found: false, selector: null };
+  document.querySelectorAll('[data-pw="pw-rowhdr"]').forEach(function (e) { e.removeAttribute('data-pw'); });
+  el.setAttribute('data-pw', 'pw-rowhdr');
+  return { found: true, selector: '[data-pw="pw-rowhdr"]', matched: textOf(el) };
+}
+
+/**
+ * Tag the FIRST visible [role="rowheader"] inside the tagged matrix
+ * ('[data-pw="pw-matrix"]') — used by pbi_expand_all when no rowHeader is given
+ * (right-click any row header opens the same Expand/Collapse menu). Tags it
+ * `data-pw="pw-rowhdr"`. Returns {found, selector, matched}.
+ */
+export function tagFirstRowHeader() {
+  const grid = document.querySelector('[data-pw="pw-matrix"]');
+  if (!grid) return { found: false, selector: null };
+  const visible = Array.from(grid.querySelectorAll('[role="rowheader"]')).filter((h) => {
+    const r = h.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  });
+  // Prefer a row header that is an EXPANDABLE hierarchy parent — one carrying an
+  // expand/collapse affordance (its row has .expandCollapseButton). Right-clicking
+  // a leaf/Total row only offers Group/Summarize (no Expand/Collapse menu), so the
+  // literal first row (often "Total") is the wrong target. Fall back to the first
+  // visible header if none looks expandable (single-level grid).
+  const isExpandable = (h) => {
+    const row = h.closest('[role="row"]') || h.parentElement;
+    return !!(row && row.querySelector('.expandCollapseButton'));
+  };
+  const el = visible.find(isExpandable) || visible[0];
+  if (!el) return { found: false, selector: null };
+  document.querySelectorAll('[data-pw="pw-rowhdr"]').forEach(function (e) { e.removeAttribute('data-pw'); });
+  el.setAttribute('data-pw', 'pw-rowhdr');
+  return {
+    found: true,
+    selector: '[data-pw="pw-rowhdr"]',
+    matched: (el.textContent || '').trim(),
+    expandable: isExpandable(el),
+  };
+}
+
+/**
+ * Tag the NEXT collapsed (expand) or expanded (collapse) expand/collapse button
+ * inside the tagged matrix, for iterative expand-all/collapse-all. Power BI matrix
+ * hierarchy rows carry a `.expandCollapseButton` whose `aria-expanded` is "false"
+ * when collapsed / "true" when expanded. A LEFT-click toggles it (verified R0105 —
+ * this is the same affordance pbi_matrix_expand uses; the row-header RIGHT-click
+ * menu does NOT offer Expand/Collapse on this build). To expand-all: repeatedly tag
+ * + click the first aria-expanded="false" button until none remain. Returns
+ * {found, selector, remaining} where remaining = count of still-togglable buttons
+ * in the wanted direction.
+ */
+export function tagNextExpander(collapse) {
+  const grid = document.querySelector('[data-pw="pw-matrix"]');
+  if (!grid) return { found: false, selector: null, remaining: 0 };
+  const wantExpanded = collapse ? 'true' : 'false'; // to collapse, target expanded ones
+  const btns = Array.from(grid.querySelectorAll('.expandCollapseButton')).filter((b) => {
+    const r = b.getBoundingClientRect();
+    if (!(r.width > 0 && r.height > 0)) return false;
+    // aria-expanded may live on the button or its row.
+    const own = b.getAttribute('aria-expanded');
+    const row = b.closest('[role="row"]');
+    const state = own != null ? own : row ? row.getAttribute('aria-expanded') : null;
+    return state === wantExpanded;
+  });
+  if (!btns.length) return { found: false, selector: null, remaining: 0 };
+  const el = btns[0];
+  document.querySelectorAll('[data-pw="pw-expall"]').forEach(function (e) { e.removeAttribute('data-pw'); });
+  el.setAttribute('data-pw', 'pw-expall');
+  return { found: true, selector: '[data-pw="pw-expall"]', remaining: btns.length };
+}
+
+/* ------------------------------------------------------- column header sort */
+
+/**
+ * Tag a [role="columnheader"] inside a tagged grid ('[data-pw="pw-matrix"]', set
+ * by tagMatrix which the caller runs first) whose text matches `column` (exact
+ * first, then case-insensitive contains). Column headers carry an `aria-sort`
+ * attribute ("ascending"/"descending"/"none") that flips on a sort click. Tags it
+ * `data-pw="pw-colhdr"`. Returns {found, selector, matched, ariaSort}.
+ */
+export function tagColumnHeader(arg) {
+  const { column } = arg || {};
+  const grid = document.querySelector('[data-pw="pw-matrix"]');
+  if (!grid) return { found: false, selector: null };
+  const headers = Array.from(grid.querySelectorAll('[role="columnheader"]')).filter((el) => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  });
+  const textOf = (el) => (el.textContent || '').trim();
+  const lc = (column || '').toLowerCase();
+  let el =
+    headers.find((h) => textOf(h) === column) ||
+    headers.find((h) => textOf(h).toLowerCase().includes(lc));
+  if (!el) return { found: false, selector: null };
+  document.querySelectorAll('[data-pw="pw-colhdr"]').forEach(function (e) { e.removeAttribute('data-pw'); });
+  el.setAttribute('data-pw', 'pw-colhdr');
+  return { found: true, selector: '[data-pw="pw-colhdr"]', matched: textOf(el), ariaSort: el.getAttribute('aria-sort') };
+}
+
+/* --------------------------------------------------------------- drill */
+
+/**
+ * Tag a visual-header drill control on the visual whose title matches
+ * `visualTitle` (same title logic as tagVisualByTitle, inlined per the
+ * self-contained page-fn rule; without a title uses the first visible visual with
+ * a matching control). action 'down' matches a control whose aria-label ~
+ * /drill down|expand to next level|go to the next level/i; 'up' ~ /drill up/i.
+ * These header buttons ARE in the DOM even when data points are not. Tags it
+ * `data-pw="pw-drill"`. Returns {found, selector, matchedLabel, candidates}.
+ */
+export function tagDrillControl(arg) {
+  const { action, visualTitle } = arg || {};
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  const isVisible = (el) => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const titleOf = (c) => {
+    const own = (c.getAttribute('aria-label') || '').trim();
+    if (own) return own;
+    const desc = c.querySelector('[aria-label]');
+    if (desc && (desc.getAttribute('aria-label') || '').trim()) return (desc.getAttribute('aria-label') || '').trim();
+    const t = c.querySelector('.visualTitle');
+    if (t && (t.textContent || '').trim()) return (t.textContent || '').trim();
+    return null;
+  };
+  const re =
+    action === 'up'
+      ? /drill up/i
+      : /drill down|expand to next level|go to the next level/i;
+  const visible = q('.visualContainer').filter(isVisible);
+  const withTitle = visible.map((c) => ({ el: c, title: titleOf(c) }));
+  // Scope to the matching visual when a title is given; else scan all visuals.
+  let scopes = visible;
+  if (visualTitle) {
+    const lc = visualTitle.toLowerCase();
+    const hit =
+      withTitle.find((o) => o.title === visualTitle) ||
+      withTitle.find((o) => o.title && o.title.toLowerCase().includes(lc));
+    if (!hit) {
+      return { found: false, selector: null, candidates: withTitle.map((o) => o.title).filter(Boolean) };
+    }
+    scopes = [hit.el];
+  }
+  const labelOf = (el) => (el.getAttribute('aria-label') || '').trim();
+  let btn = null;
+  for (const scope of scopes) {
+    btn = Array.from(scope.querySelectorAll('[aria-label]'))
+      .filter(isVisible)
+      .find((el) => re.test(labelOf(el)));
+    if (btn) break;
+  }
+  if (!btn) {
+    return { found: false, selector: null, candidates: withTitle.map((o) => o.title).filter(Boolean) };
+  }
+  document.querySelectorAll('[data-pw="pw-drill"]').forEach(function (e) { e.removeAttribute('data-pw'); });
+  btn.setAttribute('data-pw', 'pw-drill');
+  return { found: true, selector: '[data-pw="pw-drill"]', matchedLabel: labelOf(btn) };
+}

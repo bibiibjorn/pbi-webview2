@@ -1,5 +1,5 @@
 /**
- * Tool catalog — registers all 46 pbi-webview2 tools on the McpServer.
+ * Tool catalog — registers all 51 pbi-webview2 tools on the McpServer.
  *
  * Every tool wraps its work in withReport(fn) (lazy connect + reconnect-retry),
  * returns compact JSON via ok(), and never leaks window.powerBIAccessToken.
@@ -1915,6 +1915,300 @@ export function registerTools(server) {
           } finally {
             await restoreChrome();
           }
+        })
+      )
+  );
+
+  /* ---------------------------------------------------------------------- */
+  /* WAVE 4 interaction tools: expand_all / sort_column / multiselect_slicer */
+  /* drill / keyboard_nav — thin wrappers over the existing primitives.     */
+  /* ---------------------------------------------------------------------- */
+
+  /* 27i. pbi_expand_all --------------------------------------------------- */
+  // Expand/collapse ALL matrix hierarchy levels by iteratively LEFT-clicking the
+  // per-row .expandCollapseButton affordances (the same ones pbi_matrix_expand
+  // uses), NOT the row-header right-click menu. VERIFIED (R0105, 2026-07-15): the
+  // rowheader right-click menu offers only Group/Summarize on this build — no
+  // Expand/Collapse item — so the menu approach fails. Left-clicking each collapsed
+  // (aria-expanded="false") button until none remain expands the whole hierarchy;
+  // clicking each expanded one collapses it. Capped to avoid runaway on huge grids.
+  server.registerTool(
+    'pbi_expand_all',
+    {
+      description:
+        'Expand (or collapse) ALL levels of a matrix hierarchy by iteratively left-clicking every row\'s expand/collapse button (the +/- affordance), re-tagging the grid after each repaint. Picks the matrix by titleMatch (else the default biggest grid). Returns {connected:true, action:"expand-all"|"collapse-all", rowsBefore, rowsAfter, clicks, changed}. If no matrix → {found:false, code:"not-found"}. If the grid has no expandable rows (flat table / already fully expanded) → {changed:false, clicks:0}.',
+      inputSchema: {
+        titleMatch: z.string().optional(),
+        collapse: z.boolean().optional(),
+        maxClicks: z.number().int().optional().describe('Safety cap on total button clicks (default 60)'),
+      },
+    },
+    async ({ titleMatch, collapse, maxClicks = 60 }) =>
+      guard(() =>
+        withReport(async (page) => {
+          const tag = await page.evaluate(F.tagMatrix, { titleMatch });
+          if (!tag.found) {
+            return { connected: true, found: false, code: REASON.NOT_FOUND, reason: 'no matrix', titles: tag.titles };
+          }
+          const rowsBefore = await page.evaluate(F.taggedMatrixRowCount);
+          let clicks = 0;
+          // Iteratively tag+click the next togglable expander. Each click repaints
+          // the grid (new child rows appear / rows disappear), so re-tag the matrix
+          // and re-scan every iteration. Stop when none remain or the cap is hit.
+          while (clicks < maxClicks) {
+            await page.evaluate(F.tagMatrix, { titleMatch, index: tag.index });
+            const next = await page.evaluate(F.tagNextExpander, !!collapse);
+            if (!next.found) break;
+            try {
+              await robustClick(page, next.selector, false);
+            } catch (e) {
+              break; // button vanished mid-repaint — treat as done
+            }
+            clicks++;
+            await new Promise((r) => setTimeout(r, 250)); // let the row(s) repaint
+          }
+          await page.evaluate(F.tagMatrix, { titleMatch, index: tag.index });
+          const rowsAfter = await page.evaluate(F.taggedMatrixRowCount);
+          return {
+            connected: true,
+            action: collapse ? 'collapse-all' : 'expand-all',
+            rowsBefore,
+            rowsAfter,
+            clicks,
+            changed: rowsAfter !== rowsBefore,
+            cappedAt: clicks >= maxClicks ? maxClicks : undefined,
+          };
+        })
+      )
+  );
+
+  /* 27j. pbi_sort_column -------------------------------------------------- */
+  // Sort a grid by clicking a column header (its aria-sort flips). tagMatrix picks
+  // the biggest grid (pivotTable/matrix); tableEx grids also expose columnheaders.
+  server.registerTool(
+    'pbi_sort_column',
+    {
+      description:
+        'Sort a grid/matrix by clicking a column header (its aria-sort attribute flips). Picks the grid by titleMatch (else the default biggest grid), tags the column header matching `column` (exact then contains), clicks it, and verifies aria-sort changed. Returns {connected:true, column, ariaSortBefore, ariaSortAfter, changed, matched}. No grid → {found:false, code:"not-found"}; column not found → {found:false, code:"not-found", column}.',
+      inputSchema: {
+        column: z.string(),
+        titleMatch: z.string().optional(),
+      },
+    },
+    async ({ column, titleMatch }) =>
+      guard(() =>
+        withReport(async (page) => {
+          const tag = await page.evaluate(F.tagMatrix, { titleMatch });
+          if (!tag.found) {
+            return { connected: true, found: false, code: REASON.NOT_FOUND, reason: 'no grid matched', titles: tag.titles };
+          }
+          const hdr = await page.evaluate(F.tagColumnHeader, { column });
+          if (!hdr.found) {
+            return { connected: true, found: false, code: REASON.NOT_FOUND, reason: 'column not found', column };
+          }
+          const ariaSortBefore = hdr.ariaSort;
+          await robustClick(page, hdr.selector, false);
+          // Poll for aria-sort to change (re-tag the grid + column after repaint).
+          const res = await poll(
+            async () => {
+              await page.evaluate(F.tagMatrix, { titleMatch, index: tag.index });
+              const h = await page.evaluate(F.tagColumnHeader, { column });
+              return h.found ? h.ariaSort : null;
+            },
+            (v) => v != null && v !== ariaSortBefore,
+            5000
+          );
+          return {
+            connected: true,
+            column,
+            matched: hdr.matched,
+            ariaSortBefore,
+            ariaSortAfter: res.satisfied ? res.value : ariaSortBefore,
+            changed: res.satisfied,
+          };
+        })
+      )
+  );
+
+  /* 27k. pbi_multiselect_slicer ------------------------------------------- */
+  // Ctrl-multi-select list slicer items: click the first WITHOUT Ctrl (fresh
+  // selection), Ctrl+click the rest (add to selection). Reuses tagSlicerItem +
+  // robustClick(ctrl). Popup/list must be visible.
+  server.registerTool(
+    'pbi_multiselect_slicer',
+    {
+      description:
+        'Multi-select list slicer items: clicks the first value normally (fresh selection) then Ctrl+clicks the rest (adds to selection). Values must be visible list slicer items (open the popup first if needed). Returns {connected:true, requested, clicked:[...], notFound:[...], selectedCount}. Mutates a filter — restore after.',
+      inputSchema: {
+        values: z.array(z.string()).min(1),
+      },
+    },
+    async ({ values }) =>
+      guard(() =>
+        withReport(async (page) => {
+          const clicked = [];
+          const notFound = [];
+          for (let i = 0; i < values.length; i++) {
+            const value = values[i];
+            const tag = await page.evaluate(F.tagSlicerItem, value);
+            if (!tag.found) {
+              notFound.push(value);
+              continue;
+            }
+            // First item: fresh selection (no Ctrl). Rest: add to selection (Ctrl).
+            await robustClick(page, tag.selector, i > 0 && clicked.length > 0);
+            clicked.push(value);
+            await new Promise((r) => setTimeout(r, 250));
+          }
+          const selectedCount = await page.evaluate(
+            () => document.querySelectorAll('.slicerItemContainer[aria-selected="true"]').length
+          );
+          return { connected: true, requested: values, clicked, notFound, selectedCount };
+        })
+      )
+  );
+
+  /* 27l. pbi_drill -------------------------------------------------------- */
+  // Drill down/up via the visual-header drill control (those buttons ARE in the
+  // DOM even when data points are not); drill-through via a data-point context
+  // menu. Honest reason codes when a control/data point is absent — never crash.
+  server.registerTool(
+    'pbi_drill',
+    {
+      description:
+        'Drill a visual: action "down"/"up" click the visual-header drill control (aria-label ~ "Drill down"/"Expand to next level"/"Drill up") on the visual matching visualTitle (else the first with such a control); action "through" right-clicks a data point (dataPoint aria-label), opens its menu, and picks Drill through (optionally to target page). Returns {connected:true, drilled:true, action, landedPage?} or an honest {drilled:false, code:"not-found"|"not-extractable", reason}. NOTE (verified 2026-07-15): chart data points are NOT persistent in the DOM, so "through" may return not-extractable; header drill controls are reliable.',
+      inputSchema: {
+        action: z.enum(['down', 'up', 'through']),
+        visualTitle: z.string().optional(),
+        dataPoint: z.string().optional(),
+        target: z.string().optional(),
+      },
+    },
+    async ({ action, visualTitle, dataPoint, target }) =>
+      guard(() =>
+        withReport(async (page) => {
+          if (action === 'down' || action === 'up') {
+            const ctl = await page.evaluate(F.tagDrillControl, { action, visualTitle });
+            if (!ctl.found) {
+              return {
+                connected: true,
+                drilled: false,
+                code: REASON.NOT_FOUND,
+                reason: 'no drill ' + action + ' control',
+                candidates: ctl.candidates,
+              };
+            }
+            await robustClick(page, ctl.selector, false);
+            // Give the visual a moment to re-query/repaint; page does not change.
+            await new Promise((r) => setTimeout(r, 800));
+            const light = await page.evaluate(F.pageMetadataLight);
+            return {
+              connected: true,
+              drilled: true,
+              action,
+              matchedLabel: ctl.matchedLabel,
+              activePage: light.activePage,
+              visibleVisualCount: light.visibleVisualCount,
+            };
+          }
+          // action === 'through': right-click a data point → Drill through menu.
+          const tag = await page.evaluate(F.tagForContext, { ariaLabel: dataPoint });
+          if (!tag.found) {
+            return {
+              connected: true,
+              drilled: false,
+              code: REASON.NOT_EXTRACTABLE,
+              reason: dataPoint ? 'data point not found' : 'dataPoint aria-label required for drill through',
+            };
+          }
+          const pt = await page.evaluate(F.clickPointForSelector, { selector: tag.selector });
+          if (!pt || !pt.found) {
+            return { connected: true, drilled: false, code: REASON.NOT_EXTRACTABLE, reason: 'data point has no bounding box' };
+          }
+          await page.mouse.click(pt.x, pt.y, { button: 'right' });
+          const menu = await poll(
+            () => page.evaluate(F.readMenuItems),
+            (v) => v && v.menuOpen && v.items.length > 0,
+            3000
+          );
+          if (!menu.satisfied || !menu.value || !menu.value.menuOpen) {
+            return { connected: true, drilled: false, code: REASON.NOT_FOUND, reason: 'no context menu appeared', matchedLabel: tag.matchedLabel };
+          }
+          const menuItems = menu.value.items;
+          const mi = await page.evaluate(F.tagMenuItem, 'Drill through');
+          if (!mi.found) {
+            await page.keyboard.press('Escape');
+            return { connected: true, drilled: false, code: REASON.NOT_FOUND, reason: 'no Drill through menu item', menuItems };
+          }
+          const startPage = await page.evaluate(F.activePageName);
+          await robustClick(page, mi.selector, false);
+          // A submenu of target pages may open — pick the target if given.
+          if (target) {
+            const sub = await poll(
+              () => page.evaluate(F.readMenuItems),
+              (v) => v && v.menuOpen && v.items.length > 0,
+              2000
+            );
+            if (sub.satisfied) {
+              const tmi = await page.evaluate(F.tagMenuItem, target);
+              if (tmi.found) await robustClick(page, tmi.selector, false);
+            }
+          }
+          const res = await poll(
+            () => page.evaluate(F.activePageName),
+            (v) => v && v !== startPage,
+            4000
+          );
+          return {
+            connected: true,
+            drilled: res.satisfied,
+            action: 'through',
+            landedPage: res.value,
+            menuItems,
+          };
+        })
+      )
+  );
+
+  /* 27m. pbi_keyboard_nav ------------------------------------------------- */
+  // Focus-order / a11y audit: trusted Tab presses, recording activeElement role +
+  // accessible name + whether focus is inside the report canvas. Stops when focus
+  // leaves the canvas into app chrome (after having been in it) or at maxStops.
+  server.registerTool(
+    'pbi_keyboard_nav',
+    {
+      description:
+        'Accessibility focus-order audit: presses Tab (TRUSTED) up to maxStops (default 30), recording each stop as {i, role, name, inCanvas}. inCanvas = whether document.activeElement is inside a .visualContainer / canvas region (vs. app chrome). Stops when focus LEAVES the canvas after having entered it, or at maxStops. Returns {connected:true, order:[...], stops, leftCanvasAt}. Read-only tabbing (does not click).',
+      inputSchema: {
+        maxStops: z.number().int().optional(),
+      },
+    },
+    async ({ maxStops = 30 }) =>
+      guard(() =>
+        withReport(async (page) => {
+          const order = [];
+          let leftCanvasAt = null;
+          let wasInCanvas = false;
+          for (let i = 0; i < maxStops; i++) {
+            await page.keyboard.press('Tab');
+            const stop = await page.evaluate(() => {
+              const ae = document.activeElement;
+              if (!ae) return { role: null, name: null, inCanvas: false };
+              const role = (ae.getAttribute && ae.getAttribute('role')) || ae.tagName || null;
+              const name = ((ae.getAttribute && ae.getAttribute('aria-label')) || ae.textContent || '').trim().slice(0, 60);
+              const inCanvas = !!(ae.closest && ae.closest('.visualContainer, [role="tabpanel"], .displayArea'));
+              return { role, name, inCanvas };
+            });
+            order.push({ i, role: stop.role, name: stop.name, inCanvas: stop.inCanvas });
+            if (stop.inCanvas) {
+              wasInCanvas = true;
+            } else if (wasInCanvas) {
+              // Focus left the canvas into chrome after having been inside it.
+              leftCanvasAt = i;
+              break;
+            }
+          }
+          return { connected: true, order, stops: order.length, leftCanvasAt };
         })
       )
   );
