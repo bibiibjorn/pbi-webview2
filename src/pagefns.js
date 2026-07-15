@@ -1288,6 +1288,21 @@ export function tagDaxRunButton() {
   return { found: true, selector: '[data-pw="pw-daxrun"]' };
 }
 
+/**
+ * Run Monaco's built-in "Format Document" on the active DAX editor and return the
+ * reformatted text. VERIFIED (2026-07-15): 'editor.action.formatDocument' IS a
+ * supported action in the daxQueryView editor (getSupportedActions lists it).
+ * ASYNC: the action's run() returns a promise — return it so page.evaluate awaits.
+ */
+export function runMonacoFormat() {
+  if (!window.monaco || !monaco.editor) return { ok: false, reason: 'no monaco' };
+  const eds = monaco.editor.getEditors ? monaco.editor.getEditors() : [];
+  if (!eds.length) return { ok: false, reason: 'no editor' };
+  const a = eds[0].getAction('editor.action.formatDocument');
+  if (!a) return { ok: false, reason: 'no format action' };
+  return a.run().then(() => ({ ok: true, text: eds[0].getModel().getValue() }));
+}
+
 /* ---------------------------------------------------------------- dialog */
 // Runs in the desktopDialogHost page target (only exists while a dialog shows).
 

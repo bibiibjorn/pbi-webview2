@@ -1,5 +1,5 @@
 /**
- * Tool catalog — registers all 37 pbi-webview2 tools on the McpServer.
+ * Tool catalog — registers all 41 pbi-webview2 tools on the McpServer.
  *
  * Every tool wraps its work in withReport(fn) (lazy connect + reconnect-retry),
  * returns compact JSON via ok(), and never leaks window.powerBIAccessToken.
@@ -17,6 +17,15 @@ import path from 'node:path';
 import { withReport, consoleSnapshot, reset, HINT } from './connection.js';
 import { launchDesktop, findDesktopPid, killDesktop } from './launch.js';
 import * as F from './pagefns.js';
+import { buildInfoQuery } from './model.js';
+
+/**
+ * Captured Monaco editor text keyed by target ('dax'|'tmdl'). pbi_editor_buffer
+ * captures/restores here; the DAX-view tools (pbi_dax_query/dax_batch/model_info)
+ * auto-capture the prior buffer before overwriting so it can be restored. Module
+ * scope = one process-wide buffer per target (matches the single Desktop instance).
+ */
+const _editorBuffers = new Map();
 
 const OUTPUT_DIR =
   process.env.PBI_OUTPUT_DIR || path.join(os.tmpdir(), 'pbi-webview2-output');
@@ -136,6 +145,49 @@ async function svgAwareClick(page, selector, ctrl) {
   }
   const r = await robustClick(page, selector, ctrl);
   return { ...r, clickedAt: pt && pt.found ? { x: pt.x, y: pt.y } : null };
+}
+
+/**
+ * Set + run ONE DAX query in an already-resolved daxQueryView page and read the
+ * results grid. This is the shared run primitive: pbi_dax_query, pbi_dax_batch,
+ * and pbi_model_info all call it (DRY). It does NOT capture/restore the editor
+ * buffer — the caller owns buffer policy. Logic mirrors the original inline
+ * pbi_dax_query run: setMonacoText → trusted F5 → poll readDaxResults → fall back
+ * to a visible "Run" button. Returns one of:
+ *   {ran:false, reason}                       (could not set text / no render)
+ *   {ran:true, error}                         (query error banner)
+ *   {ran:true, columns, rows, rowCount}       (results)
+ */
+async function runOneDax(daxPage, dax, timeoutMs = 30000) {
+  const set = await daxPage.evaluate(F.setMonacoText, dax);
+  if (!set.monaco) return { ran: false, reason: 'no Monaco editor in the DAX query view' };
+  if (!set.took) return { ran: false, reason: `could not set editor text (${set.reason || 'unknown'})` };
+  // Run: trusted F5 on the focused editor. Focus was set by setMonacoText.
+  await daxPage.keyboard.press('F5');
+  // Poll for a results grid (or error banner) to appear.
+  let res = await poll(
+    () => daxPage.evaluate(F.readDaxResults),
+    (v) => v && (v.hasResult || v.error),
+    Math.min(timeoutMs, 6000)
+  );
+  // If nothing rendered on F5, defensively try a visible "Run" button.
+  if (!res.satisfied) {
+    const runTag = await daxPage.evaluate(F.tagDaxRunButton);
+    if (runTag.found) {
+      await robustClick(daxPage, runTag.selector, false);
+      res = await poll(
+        () => daxPage.evaluate(F.readDaxResults),
+        (v) => v && (v.hasResult || v.error),
+        timeoutMs
+      );
+    }
+  }
+  const v = res.value;
+  if (!v || (!v.hasResult && !v.error)) {
+    return { ran: false, reason: 'no results or error rendered within timeout' };
+  }
+  if (v.error) return { ran: true, error: v.error };
+  return { ran: true, columns: v.columns, rows: v.rows, rowCount: v.rowCount };
 }
 
 export function registerTools(server) {
@@ -1380,54 +1432,206 @@ export function registerTools(server) {
   );
 
   /* 27. pbi_dax_query ----------------------------------------------------- */
-  // WARNING: OVERWRITES whatever the user had in the DAX query editor. Prior text
-  // is NOT captured/restored (we cannot recover it) — document the caveat only.
+  // OVERWRITES the DAX query editor. The prior text is auto-captured into the
+  // shared _editorBuffers('dax') before overwriting; pass restore:true to put it
+  // back after reading results (or restore later via pbi_editor_buffer restore).
   server.registerTool(
     'pbi_dax_query',
     {
       description:
-        'Write DAX into the DAX query view editor and RUN it, then read the results grid. Reaches the daxQueryView CDP target (SEPARATE from reportView); {ok:false, reason} if the view has never been opened in Desktop (open the DAX query view tab first — this tool will NOT open ribbon views). Runs via F5 on the focused editor, falling back to a visible "Run" button. Returns {ran, columns, rows, rowCount, error?}. CAVEAT: this OVERWRITES whatever DAX the user had in the query editor — prior text is NOT restored (unrecoverable). Use a throwaway query view.',
+        'Write DAX into the DAX query view editor and RUN it, then read the results grid. Reaches the daxQueryView CDP target (SEPARATE from reportView); {ok:false, reason} if the view has never been opened in Desktop (open the DAX query view tab first — this tool will NOT open ribbon views). Runs via F5 on the focused editor, falling back to a visible "Run" button. Returns {ran, columns, rows, rowCount, error?}. This OVERWRITES whatever DAX the user had in the query editor; the prior text is captured first, and restore:true re-instates it in the editor after reading results (it is also recoverable via pbi_editor_buffer {action:"restore"}).',
       inputSchema: {
         dax: z.string().describe('The DAX to run (EVALUATE …). Overwrites the editor content.'),
         timeoutMs: z.number().int().optional().describe('How long to poll for results (default 30000)'),
+        restore: z
+          .boolean()
+          .optional()
+          .describe('Re-instate the prior editor text after reading results (default false)'),
       },
     },
-    async ({ dax, timeoutMs = 30000 }) =>
+    async ({ dax, timeoutMs = 30000, restore }) =>
       guard(() =>
         withReport(async (page) => {
           const daxPage = page.context().pages().find((p) => p.url().includes('daxQueryView'));
           if (!daxPage) {
             return { ok: false, reason: 'DAX query view not open — open it in Desktop first' };
           }
-          const set = await daxPage.evaluate(F.setMonacoText, dax);
-          if (!set.monaco) return { ok: false, reason: 'no Monaco editor in the DAX query view' };
-          if (!set.took) return { ok: false, reason: `could not set editor text (${set.reason || 'unknown'})` };
-          // Run: trusted F5 on the focused editor. Focus was set by setMonacoText.
-          await daxPage.keyboard.press('F5');
-          // Poll for a results grid (or error banner) to appear.
-          let res = await poll(
-            () => daxPage.evaluate(F.readDaxResults),
-            (v) => v && (v.hasResult || v.error),
-            Math.min(timeoutMs, 6000)
-          );
-          // If nothing rendered on F5, defensively try a visible "Run" button.
-          if (!res.satisfied) {
-            const runTag = await daxPage.evaluate(F.tagDaxRunButton);
-            if (runTag.found) {
-              await robustClick(daxPage, runTag.selector, false);
-              res = await poll(
-                () => daxPage.evaluate(F.readDaxResults),
-                (v) => v && (v.hasResult || v.error),
-                timeoutMs
-              );
+          // Capture the current buffer BEFORE overwriting so it is recoverable.
+          const prior = await daxPage.evaluate(F.readMonacoText);
+          const priorText = prior && (prior.text != null ? prior.text : null);
+          if (priorText != null) _editorBuffers.set('dax', priorText);
+
+          const r = await runOneDax(daxPage, dax, timeoutMs);
+
+          // Restore the prior editor text after reading results, if requested.
+          if (restore && priorText != null) {
+            await daxPage.evaluate(F.setMonacoText, priorText);
+          }
+
+          if (!r.ran) return { ok: true, ran: false, reason: r.reason };
+          if (r.error) return { ok: true, ran: true, error: r.error };
+          return { ok: true, ran: true, columns: r.columns, rows: r.rows, rowCount: r.rowCount };
+        })
+      )
+  );
+
+  /* 27a. pbi_editor_buffer ------------------------------------------------ */
+  // Safety primitive: capture the Monaco editor text (dax or tmdl) so a later
+  // overwrite (pbi_dax_query etc.) can be undone via restore.
+  server.registerTool(
+    'pbi_editor_buffer',
+    {
+      description:
+        'Capture / restore the Monaco editor buffer of the DAX or TMDL view (safety net for the overwriting DAX tools). action:"capture" reads the current editor text and stores it (keyed by target); action:"restore" writes the last captured text back into the editor. target "dax" reaches the daxQueryView CDP target, "tmdl" the tmdlView target (default "dax"); {ok:false, reason} if that view is not open in Desktop. Returns {ok, captured|restored, target, ...}.',
+      inputSchema: {
+        action: z.enum(['capture', 'restore']),
+        target: z.enum(['dax', 'tmdl']).optional().describe('Which editor view (default "dax")'),
+      },
+    },
+    async ({ action, target = 'dax' }) =>
+      guard(() =>
+        withReport(async (page) => {
+          const urlFrag = target === 'tmdl' ? 'tmdlView' : 'daxQueryView';
+          const edPage = page.context().pages().find((p) => p.url().includes(urlFrag));
+          if (!edPage) {
+            return { ok: false, reason: `${target} view not open` };
+          }
+          if (action === 'capture') {
+            const res = await edPage.evaluate(F.readMonacoText);
+            const text = res && (res.text != null ? res.text : null);
+            _editorBuffers.set(target, text);
+            return { ok: true, captured: true, target, length: text != null ? text.length : 0 };
+          }
+          // restore
+          if (!_editorBuffers.has(target) || _editorBuffers.get(target) == null) {
+            return { ok: true, restored: false, reason: 'nothing captured for ' + target };
+          }
+          await edPage.evaluate(F.setMonacoText, _editorBuffers.get(target));
+          return { ok: true, restored: true, target };
+        })
+      )
+  );
+
+  /* 27b. pbi_model_info --------------------------------------------------- */
+  server.registerTool(
+    'pbi_model_info',
+    {
+      description:
+        'Read model metadata (measures / tables / columns / relationships) via INFO.VIEW.* DAX run in the DAX query view. Reaches the daxQueryView CDP target; {ok:false, reason} if that view is not open in Desktop (open the DAX query view tab first — this tool will NOT open ribbon views). Optional table (exact [Table] filter), nameLike (CONTAINSSTRING on [Name]), top (row cap). By default the large Expression / FormatStringDefinition / DetailRowsDefinition columns are dropped to keep payloads small — pass includeExpression:true to keep them. Auto-captures + restores the prior editor buffer. Returns {ok, object, count, columns, rows}.',
+      inputSchema: {
+        object: z.enum(['measures', 'tables', 'columns', 'relationships']),
+        table: z.string().optional().describe('Exact [Table] filter'),
+        nameLike: z.string().optional().describe('CONTAINSSTRING match on [Name]'),
+        top: z.number().int().optional().describe('Cap rows (TOPN)'),
+        includeExpression: z
+          .boolean()
+          .optional()
+          .describe('Keep the heavy Expression/FormatStringDefinition/DetailRowsDefinition columns'),
+      },
+    },
+    async ({ object, table, nameLike, top, includeExpression }) =>
+      guard(() =>
+        withReport(async (page) => {
+          const daxPage = page.context().pages().find((p) => p.url().includes('daxQueryView'));
+          if (!daxPage) {
+            return { ok: false, reason: 'DAX query view not open — open it in Desktop first' };
+          }
+          // Auto-capture the prior buffer so we can restore it (this OVERWRITES).
+          const prior = await daxPage.evaluate(F.readMonacoText);
+          const priorText = prior && (prior.text != null ? prior.text : null);
+          if (priorText != null) _editorBuffers.set('dax', priorText);
+
+          const dax = buildInfoQuery(object, { table, nameLike, top });
+          const r = await runOneDax(daxPage, dax, 30000);
+
+          // Restore prior buffer regardless of query outcome.
+          if (priorText != null) {
+            await daxPage.evaluate(F.setMonacoText, priorText);
+          }
+
+          if (!r.ran) return { ok: true, object, ran: false, reason: r.reason };
+          if (r.error) return { ok: true, object, error: r.error };
+
+          let columns = r.columns || [];
+          let rows = r.rows || [];
+          if (!includeExpression) {
+            // Drop heavy columns + the matching cell in every row (keep payload small).
+            const dropSet = new Set(['Expression', 'FormatStringDefinition', 'DetailRowsDefinition']);
+            const keepIdx = columns.map((c, i) => (dropSet.has(c) ? -1 : i)).filter((i) => i >= 0);
+            columns = keepIdx.map((i) => columns[i]);
+            rows = rows.map((row) => keepIdx.map((i) => row[i]));
+          }
+          return { ok: true, object, count: rows.length, columns, rows };
+        })
+      )
+  );
+
+  /* 27c. pbi_dax_batch ---------------------------------------------------- */
+  server.registerTool(
+    'pbi_dax_batch',
+    {
+      description:
+        'Run N DAX queries (1–20) sequentially in the DAX query view and collect each result. Reaches the daxQueryView CDP target; {ok:false, reason} if that view is not open in Desktop. Auto-captures the prior editor buffer and restores it after the last query (default true — batch runs are throwaway). Returns {ok, results:[{query, ran, columns?, rows?, rowCount?, error?}], count}.',
+      inputSchema: {
+        queries: z.array(z.string()).min(1).max(20).describe('The DAX queries to run in order'),
+        restore: z.boolean().optional().describe('Re-instate the prior editor text after the last query (default true)'),
+      },
+    },
+    async ({ queries, restore = true }) =>
+      guard(() =>
+        withReport(async (page) => {
+          const daxPage = page.context().pages().find((p) => p.url().includes('daxQueryView'));
+          if (!daxPage) {
+            return { ok: false, reason: 'DAX query view not open — open it in Desktop first' };
+          }
+          // Auto-capture the prior buffer (this OVERWRITES the editor per query).
+          const prior = await daxPage.evaluate(F.readMonacoText);
+          const priorText = prior && (prior.text != null ? prior.text : null);
+          if (priorText != null) _editorBuffers.set('dax', priorText);
+
+          const results = [];
+          for (const q of queries) {
+            const r = await runOneDax(daxPage, q, 30000);
+            const entry = { query: q, ran: !!r.ran };
+            if (r.error) entry.error = r.error;
+            else if (r.ran) {
+              entry.columns = r.columns;
+              entry.rows = r.rows;
+              entry.rowCount = r.rowCount;
+            } else if (r.reason) {
+              entry.error = r.reason;
             }
+            results.push(entry);
           }
-          const v = res.value;
-          if (!v || (!v.hasResult && !v.error)) {
-            return { ok: true, ran: false, reason: 'no results or error rendered within timeout' };
+
+          if (restore && priorText != null) {
+            await daxPage.evaluate(F.setMonacoText, priorText);
           }
-          if (v.error) return { ok: true, ran: true, error: v.error };
-          return { ok: true, ran: true, columns: v.columns, rows: v.rows, rowCount: v.rowCount };
+          return { ok: true, results, count: results.length };
+        })
+      )
+  );
+
+  /* 27d. pbi_format_dax --------------------------------------------------- */
+  server.registerTool(
+    'pbi_format_dax',
+    {
+      description:
+        'Format the DAX query editor buffer via Monaco\'s "Format Document" action (editor.action.formatDocument). Reaches the daxQueryView CDP target; {ok:false, reason} if that view is not open in Desktop, or if the editor / format action is unavailable. Returns {ok:true, formatted:true, text} with the reformatted DAX.',
+      inputSchema: {},
+    },
+    async () =>
+      guard(() =>
+        withReport(async (page) => {
+          const daxPage = page.context().pages().find((p) => p.url().includes('daxQueryView'));
+          if (!daxPage) {
+            return { ok: false, reason: 'DAX query view not open — open it in Desktop first' };
+          }
+          const res = await daxPage.evaluate(F.runMonacoFormat);
+          if (!res || !res.ok) {
+            return { ok: false, reason: (res && res.reason) || 'format failed' };
+          }
+          return { ok: true, formatted: true, text: res.text };
         })
       )
   );
