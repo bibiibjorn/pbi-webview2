@@ -1,5 +1,5 @@
 /**
- * Tool catalog — registers all 51 pbi-webview2 tools on the McpServer.
+ * Tool catalog — registers all 55 pbi-webview2 tools on the McpServer.
  *
  * Every tool wraps its work in withReport(fn) (lazy connect + reconnect-retry),
  * returns compact JSON via ok(), and never leaks window.powerBIAccessToken.
@@ -2209,6 +2209,228 @@ export function registerTools(server) {
             }
           }
           return { connected: true, order, stops: order.length, leftCanvasAt };
+        })
+      )
+  );
+
+  /* ---------------------------------------------------------------------- */
+  /* WAVE 5 agentic-loop tools: page_digest / diff_state / assert /          */
+  /* annotate_screenshot — compose the digest primitive above.              */
+  /* ---------------------------------------------------------------------- */
+
+  /* 27n. pbi_page_digest -------------------------------------------------- */
+  // ONE-call page judgment: pageDigestBatch aggregates visuals + cards + badges
+  // + slicer selections + broken-visuals in a SINGLE round-trip; the tool adds
+  // the console-error count and the (undetectable-over-CDP) dirty:null.
+  server.registerTool(
+    'pbi_page_digest',
+    {
+      description:
+        'ONE-call page judgment for the agentic loop: visuals+cards+badges+slicers+broken-visuals+console-errors in a single round-trip. The tool an autonomous act->observe->judge loop calls after each action. dirty is always null (undetectable over CDP).',
+      inputSchema: {},
+    },
+    async () =>
+      guard(() =>
+        withReport(async (page) => {
+          const d = await page.evaluate(F.pageDigestBatch);
+          const cs = consoleSnapshot();
+          return { connected: true, ...d, consoleErrorCount: cs.errors.length, dirty: null };
+        })
+      )
+  );
+
+  /* 27o. pbi_diff_state --------------------------------------------------- */
+  // Capture / compare FULL page digests. Reuses the BASELINE_DIR file-store like
+  // pbi_baseline, but under a distinct `digest-<name>.json` prefix so digest
+  // snapshots never collide with pbi_baseline's card-only baselines. list needs
+  // no page (no withReport); capture/compare do.
+  server.registerTool(
+    'pbi_diff_state',
+    {
+      description:
+        'Capture / compare / list full page-digest snapshots (the pbi_page_digest payload). capture: store the current digest under a name to <outputDir>/baselines/digest-<name>.json. compare: re-digest + structurally diff (cardsChanged/Added/Removed by title, visualCountDelta, brokenVisualsDelta, activePageChanged, slicerChanges). list: available digest snapshot names. Distinct store from pbi_baseline (digest- prefix).',
+      inputSchema: {
+        action: z.enum(['capture', 'compare', 'list']),
+        name: z.string().optional(),
+      },
+    },
+    async ({ action, name }) => {
+      if (action === 'list') {
+        ensureDir(BASELINE_DIR);
+        const names = fs
+          .readdirSync(BASELINE_DIR)
+          .filter((f) => f.startsWith('digest-') && f.endsWith('.json'))
+          .map((f) => f.replace(/^digest-/, '').replace(/\.json$/, ''));
+        return ok({ connected: true, action: 'list', names });
+      }
+      if (!name) return ok({ connected: false, error: 'name is required for capture/compare' });
+
+      return guard(() =>
+        withReport(async (page) => {
+          const file = path.join(BASELINE_DIR, `digest-${name}.json`);
+
+          if (action === 'capture') {
+            ensureDir(BASELINE_DIR);
+            const digest = await page.evaluate(F.pageDigestBatch);
+            const payload = { name, capturedAt: new Date().toISOString(), digest };
+            fs.writeFileSync(file, JSON.stringify(payload, null, 2));
+            return { connected: true, action: 'capture', name, path: file };
+          }
+
+          // compare
+          if (!fs.existsSync(file)) {
+            return { connected: true, action: 'compare', name, error: `digest "${name}" not found` };
+          }
+          const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+          const before = stored.digest || {};
+          const after = await page.evaluate(F.pageDigestBatch);
+
+          // Cards diff, matched by title.
+          const bCards = new Map((before.cards || []).map((c) => [c.title, c.value]));
+          const aCards = new Map((after.cards || []).map((c) => [c.title, c.value]));
+          const cardsChanged = [];
+          const cardsRemoved = [];
+          const cardsAdded = [];
+          for (const [title, val] of bCards) {
+            if (!aCards.has(title)) cardsRemoved.push({ title, before: val });
+            else if (aCards.get(title) !== val) cardsChanged.push({ title, before: val, after: aCards.get(title) });
+          }
+          for (const [title, val] of aCards) {
+            if (!bCards.has(title)) cardsAdded.push({ title, after: val });
+          }
+
+          // Slicer changes, matched by text (aria-pressed before/after).
+          const bSlic = new Map((before.slicerSelections || []).map((s) => [s.text, s.pressed]));
+          const aSlic = new Map((after.slicerSelections || []).map((s) => [s.text, s.pressed]));
+          const slicerChanges = [];
+          for (const [text, pressed] of bSlic) {
+            if (aSlic.has(text) && aSlic.get(text) !== pressed) {
+              slicerChanges.push({ text, before: pressed, after: aSlic.get(text) });
+            }
+          }
+          for (const [text, pressed] of aSlic) {
+            if (!bSlic.has(text)) slicerChanges.push({ text, before: null, after: pressed });
+          }
+
+          const visualCountDelta = (after.visibleVisualCount || 0) - (before.visibleVisualCount || 0);
+          const brokenVisualsDelta =
+            ((after.brokenVisuals && after.brokenVisuals.length) || 0) -
+            ((before.brokenVisuals && before.brokenVisuals.length) || 0);
+          const activePageChanged =
+            before.activePage !== after.activePage
+              ? { before: before.activePage, after: after.activePage }
+              : null;
+
+          const identical =
+            cardsChanged.length === 0 &&
+            cardsAdded.length === 0 &&
+            cardsRemoved.length === 0 &&
+            visualCountDelta === 0 &&
+            brokenVisualsDelta === 0 &&
+            !activePageChanged &&
+            slicerChanges.length === 0;
+
+          return {
+            connected: true,
+            action: 'compare',
+            name,
+            identical,
+            cardsChanged,
+            cardsAdded,
+            cardsRemoved,
+            visualCountDelta,
+            brokenVisualsDelta,
+            activePageChanged,
+            slicerChanges,
+          };
+        })
+      );
+    }
+  );
+
+  /* 27p. pbi_assert ------------------------------------------------------- */
+  // Assertion helpers over ONE page digest: each PROVIDED predicate becomes a
+  // check {name, passed, actual, expected}; passed = all provided checks passed
+  // (true if none provided).
+  server.registerTool(
+    'pbi_assert',
+    {
+      description:
+        'Assert page state against a single fresh page digest. Provide any of: cardEquals {title, value} (card value string-equals), visualCountAtLeast n (visibleVisualCount >= n), noBrokenVisuals true (brokenVisuals empty), activePageIs name (activePage ===). Returns {connected:true, passed, checks:[{name, passed, actual, expected}]}. passed = all provided checks passed (true if none given).',
+      inputSchema: {
+        cardEquals: z.object({ title: z.string(), value: z.string() }).optional(),
+        visualCountAtLeast: z.number().int().optional(),
+        noBrokenVisuals: z.boolean().optional(),
+        activePageIs: z.string().optional(),
+      },
+    },
+    async ({ cardEquals, visualCountAtLeast, noBrokenVisuals, activePageIs }) =>
+      guard(() =>
+        withReport(async (page) => {
+          const d = await page.evaluate(F.pageDigestBatch);
+          const checks = [];
+          if (cardEquals) {
+            const card = (d.cards || []).find((c) => c.title === cardEquals.title);
+            const actual = card ? card.value : null;
+            checks.push({
+              name: 'cardEquals',
+              passed: actual === cardEquals.value,
+              actual,
+              expected: cardEquals.value,
+            });
+          }
+          if (visualCountAtLeast != null) {
+            checks.push({
+              name: 'visualCountAtLeast',
+              passed: (d.visibleVisualCount || 0) >= visualCountAtLeast,
+              actual: d.visibleVisualCount || 0,
+              expected: visualCountAtLeast,
+            });
+          }
+          if (noBrokenVisuals) {
+            const n = (d.brokenVisuals && d.brokenVisuals.length) || 0;
+            checks.push({ name: 'noBrokenVisuals', passed: n === 0, actual: n, expected: 0 });
+          }
+          if (activePageIs != null) {
+            checks.push({
+              name: 'activePageIs',
+              passed: d.activePage === activePageIs,
+              actual: d.activePage,
+              expected: activePageIs,
+            });
+          }
+          const passed = checks.every((c) => c.passed);
+          return { connected: true, passed, checks };
+        })
+      )
+  );
+
+  /* 27q. pbi_annotate_screenshot ------------------------------------------ */
+  // Inject numbered overlay boxes over every visible visual, screenshot, then
+  // ALWAYS remove the overlays (try/finally) so the canvas is left untouched.
+  server.registerTool(
+    'pbi_annotate_screenshot',
+    {
+      description:
+        'Screenshot the reportView page with NUMBERED overlay boxes drawn over every visible visual, saved to the output dir (never the repo). Returns {connected:true, path, legend:[{n, title, type, hasError}]} where each n maps to the labelled box on the shot. Overlays are always removed afterwards (even if the screenshot throws).',
+      inputSchema: {
+        filename: z.string().optional(),
+      },
+    },
+    async ({ filename }) =>
+      guard(() =>
+        withReport(async (page) => {
+          ensureDir(OUTPUT_DIR);
+          const legendRes = await page.evaluate(F.injectOverlays);
+          const legend = (legendRes && legendRes.legend) || [];
+          const fname = (filename || `annot-${Date.now()}.png`).replace(/[\\/]/g, '_');
+          const abs = path.join(OUTPUT_DIR, fname);
+          try {
+            await page.screenshot({ path: abs });
+          } finally {
+            await page.evaluate(F.removeOverlays);
+          }
+          return { connected: true, path: abs, legend };
         })
       )
   );

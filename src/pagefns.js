@@ -1959,3 +1959,224 @@ export function tagDrillControl(arg) {
   btn.setAttribute('data-pw', 'pw-drill');
   return { found: true, selector: '[data-pw="pw-drill"]', matchedLabel: labelOf(btn) };
 }
+
+/* -------------------------------------------------------------- page digest */
+
+/**
+ * ONE-evaluate page digest for the agentic act→observe→judge loop: returns
+ * EVERYTHING needed to judge a page in a SINGLE round-trip so an autonomous loop
+ * never has to fan out across listVisuals + readCards + stateProbe +
+ * scanBrokenVisuals. All of those helpers' logic is COMPOSED INLINE here — page
+ * functions cannot call each other (each is serialized in isolation), so the
+ * shared selectors/regexes are intentionally DUPLICATED. Returns:
+ *   {activePage, canvasReady, visibleVisualCount,
+ *    visuals:[{title,type,x,y,width,height,hasError}],  // like listVisuals
+ *    cards:[{title,value}],                              // like readCards
+ *    badges:[...],                                       // Filters Applied / Filtering by
+ *    slicerSelections:[{text,pressed}],                  // buttonSlicer aria-pressed
+ *    brokenVisuals:[{label,via}]}                        // like scanBrokenVisuals
+ * Coordinates are Math.round-ed; the visual / broken scans use only visible
+ * visuals (width>0 && height>0).
+ */
+export function pageDigestBatch() {
+  const q = (s) => Array.from(document.querySelectorAll(s));
+
+  // --- active page + canvas (pageMetadataLight logic, inlined) --------------
+  const tabs = q('[role="tab"]')
+    .map((t) => (t.textContent || '').trim())
+    .filter((t) => t.endsWith('x'));
+  const activeTabEl = q('[role="tab"][aria-selected="true"]').find((t) =>
+    (t.textContent || '').trim().endsWith('x')
+  );
+  const activePage = activeTabEl ? (activeTabEl.textContent || '').trim().replace(/x$/, '') : null;
+
+  // Shared error detection (duplicated from scanBrokenVisuals / listVisuals).
+  const errRe =
+    /can.?t display this visual|couldn.?t (load|retrieve)|something went wrong|see details|error code|out of memory|Resource Governing/i;
+  const errorSel =
+    '.errorContainer, .visualError, .cardError, .warningIcon, [class*="error" i]:not([class*="errorbar" i])';
+
+  // --- visuals (listVisuals logic, inlined) --------------------------------
+  const cls = (el) => ((el.className || '').toString());
+  const typeOf = (c) => {
+    const hostCls = /visual-([A-Za-z0-9]+)/.exec(cls(c));
+    if (hostCls) return hostCls[1];
+    const host = c.querySelector('[class*="visual-"]');
+    if (host) {
+      const m = /visual-([A-Za-z0-9]+)/.exec(cls(host));
+      if (m) return m[1];
+    }
+    return null;
+  };
+  const titleOf = (c) => {
+    const own = (c.getAttribute('aria-label') || '').trim();
+    if (own) return own;
+    const desc = c.querySelector('[aria-label]');
+    if (desc && (desc.getAttribute('aria-label') || '').trim()) return (desc.getAttribute('aria-label') || '').trim();
+    const t = c.querySelector('.visualTitle');
+    if (t && (t.textContent || '').trim()) return (t.textContent || '').trim();
+    return null;
+  };
+  const visible = q('.visualContainer').filter((c) => {
+    const r = c.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  });
+  const visuals = [];
+  const brokenVisuals = [];
+  for (const c of visible) {
+    const r = c.getBoundingClientRect();
+    const txt = (c.textContent || '').replace('Press Enter to edit', '');
+    const iconErr = !!c.querySelector(errorSel);
+    const textErr = errRe.test(txt);
+    const hasError = iconErr || textErr;
+    visuals.push({
+      title: titleOf(c),
+      type: typeOf(c),
+      x: Math.round(r.x),
+      y: Math.round(r.y),
+      width: Math.round(r.width),
+      height: Math.round(r.height),
+      hasError,
+    });
+    if (hasError) {
+      const label =
+        (c.querySelector('[aria-label]') && c.querySelector('[aria-label]').getAttribute('aria-label')) ||
+        (c.getAttribute('aria-label') || '').trim() ||
+        (c.textContent || '').replace('Press Enter to edit', '').trim().slice(0, 80) ||
+        '(unlabeled)';
+      brokenVisuals.push({ label, via: iconErr ? 'icon' : 'text' });
+    }
+  }
+  const visibleVisualCount = visible.length;
+  const canvasReady = tabs.length > 0 && q('.visualContainer').length > 0;
+
+  // --- cards (readCards logic, inlined) ------------------------------------
+  const cards = [
+    ...new Set(
+      q('.visualContainer [aria-label]')
+        .map((el) => el.getAttribute('aria-label'))
+        .filter((t) => t && / card$/.test(t))
+    ),
+  ].map((label) => {
+    // Split at the FIRST comma: title before it, value = the rest.
+    const core = label.replace(/ card$/, '').trim();
+    const idx = core.indexOf(',');
+    if (idx > -1) {
+      return { title: core.slice(0, idx).trim(), value: core.slice(idx + 1).trim() };
+    }
+    return { title: core.trim(), value: null };
+  });
+
+  // --- badges (stateProbe logic, inlined) ----------------------------------
+  const badges = [
+    ...new Set(
+      q('.visualContainer')
+        .map((el) => (el.textContent || '').replace('Press Enter to edit', '').trim())
+        .filter((t) => /Filters Applied|Filtering by/.test(t))
+    ),
+  ];
+
+  // --- slicer selections (button slicer aria-pressed, inlined) -------------
+  const slicerSelections = q('[role="button"]')
+    .filter((el) => cls(el).includes('buttonSlicerVisual'))
+    .map((el) => ({ text: (el.textContent || '').trim(), pressed: el.getAttribute('aria-pressed') }));
+
+  return {
+    activePage,
+    canvasReady,
+    visibleVisualCount,
+    visuals,
+    cards,
+    badges,
+    slicerSelections,
+    brokenVisuals,
+  };
+}
+
+/* ---------------------------------------------------------- annotate overlays */
+
+/**
+ * Inject numbered overlay boxes over every visible visual (listVisuals-style
+ * rect + title logic, inlined per the self-contained page-fn rule). Builds a
+ * single fixed-position container div `#pw-annot`; for each visual adds a 2px
+ * outlined box at its screen rect plus a small numbered label in the corner.
+ * The overlay is `pointer-events:none` so it never intercepts a later click.
+ * Returns the legend [{n, title, type, hasError}] (n is 1-based, matching the
+ * label drawn on the box). removeOverlays() tears it down again.
+ */
+export function injectOverlays() {
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  const errRe =
+    /can.?t display this visual|couldn.?t (load|retrieve)|something went wrong|see details|error code|out of memory|Resource Governing/i;
+  const errorSel =
+    '.errorContainer, .visualError, .cardError, .warningIcon, [class*="error" i]:not([class*="errorbar" i])';
+  const cls = (el) => ((el.className || '').toString());
+  const typeOf = (c) => {
+    const hostCls = /visual-([A-Za-z0-9]+)/.exec(cls(c));
+    if (hostCls) return hostCls[1];
+    const host = c.querySelector('[class*="visual-"]');
+    if (host) {
+      const m = /visual-([A-Za-z0-9]+)/.exec(cls(host));
+      if (m) return m[1];
+    }
+    return null;
+  };
+  const titleOf = (c) => {
+    const own = (c.getAttribute('aria-label') || '').trim();
+    if (own) return own;
+    const desc = c.querySelector('[aria-label]');
+    if (desc && (desc.getAttribute('aria-label') || '').trim()) return (desc.getAttribute('aria-label') || '').trim();
+    const t = c.querySelector('.visualTitle');
+    if (t && (t.textContent || '').trim()) return (t.textContent || '').trim();
+    return null;
+  };
+
+  // Remove any prior overlay first (idempotent).
+  const prior = document.getElementById('pw-annot');
+  if (prior) prior.remove();
+
+  const container = document.createElement('div');
+  container.id = 'pw-annot';
+  container.style.cssText =
+    'position:fixed;left:0;top:0;width:0;height:0;z-index:2147483647;pointer-events:none;';
+
+  const visible = q('.visualContainer').filter((c) => {
+    const r = c.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  });
+  const legend = [];
+  let n = 0;
+  for (const c of visible) {
+    n++;
+    const r = c.getBoundingClientRect();
+    const txt = (c.textContent || '').replace('Press Enter to edit', '');
+    const hasError = !!c.querySelector(errorSel) || errRe.test(txt);
+
+    const box = document.createElement('div');
+    box.style.cssText =
+      'position:fixed;box-sizing:border-box;pointer-events:none;' +
+      'left:' + Math.round(r.x) + 'px;top:' + Math.round(r.y) + 'px;' +
+      'width:' + Math.round(r.width) + 'px;height:' + Math.round(r.height) + 'px;' +
+      'outline:2px solid ' + (hasError ? '#e00' : '#0a7') + ';outline-offset:-2px;';
+
+    const label = document.createElement('div');
+    label.textContent = String(n);
+    label.style.cssText =
+      'position:fixed;pointer-events:none;font:bold 12px/1 sans-serif;color:#fff;' +
+      'background:' + (hasError ? '#e00' : '#0a7') + ';padding:2px 5px;border-radius:0 0 4px 0;' +
+      'left:' + Math.round(r.x) + 'px;top:' + Math.round(r.y) + 'px;';
+
+    container.appendChild(box);
+    container.appendChild(label);
+    legend.push({ n, title: titleOf(c), type: typeOf(c), hasError });
+  }
+  document.body.appendChild(container);
+  return { legend };
+}
+
+/** Remove the numbered overlay container injected by injectOverlays. */
+export function removeOverlays() {
+  const el = document.getElementById('pw-annot');
+  if (el) el.remove();
+  return { removed: !!el };
+}
