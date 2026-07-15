@@ -129,19 +129,21 @@ resolves, `pbi_launch` returns `{launched:false, error, hint}` telling you to
 
 ## Tools
 
-37 tools. Each returns a leading status key: the **`connected:`** family reports CDP
+55 tools. Each returns a leading status key: the **`connected:`** family reports CDP
 reachability of the report canvas (`{connected:false, ...}` when Desktop is
 unreachable); the **`ok:`** family covers escape hatches, the separate DAX/TMDL/dialog
 CDP targets, and the guarded save/close/reload tools (`{ok:false, reason}` — or a
 `{ok:true, <action>:false, reason}` refusal — when a surface isn't available or a guard
-flag wasn't passed).
+flag wasn't passed). Tools returning `found:false` / `extracted:false` also carry a
+structured **`code`** REASON (`not-found` / `not-ready` / `wrong-view` / `canvas-busy`
+/ `not-extractable`) so a loop can branch on the failure without string-matching.
 
 | Tool | Status | Key params | What it does |
 |---|---|---|---|
 | `pbi_launch` | `launched:` | `pbip`, `port?`, `waitPortMs?` | Launch Desktop WITH the CDP port (bridge-env → bridge-path → direct `PBIDesktop.exe`); injects the WebView2 debug env var; pre-flight warns about orphaned PBIDesktop/msmdsrv; reports the running instance if the port is already up. After `cdpUp:true`, call `pbi_wait_for`. |
 | `pbi_status` | `connected:` | `light?` | Connect + report build, title bar, active page, page count, zoom, canvasReady, dirty. `light:true` returns only `{activePage, canvasReady, visibleVisualCount}` (cheap hot-path probe; skips the title/zoom scan). |
 | `pbi_pages` | `connected:` | — | All page tabs `[{name, active}]`. |
-| `pbi_goto_page` | `connected:` | `name`, `waitReady?` | Exact-match page nav; verifies `aria-selected`; returns candidates on miss. |
+| `pbi_goto_page` | `connected:` | `name`, `waitReady?`, `stable?` | Exact-match page nav; verifies `aria-selected`; returns candidates on miss. `stable:true` (with `waitReady`) also waits for the render to SETTLE and returns `stableResult`. |
 | `pbi_deselect` | `connected:` | — | Clear selection via the neighbour-page-and-back trick (never blind-clicks the canvas). |
 | `pbi_state_probe` | `connected:` | — | Batched scorecard (toggles, cards, badges, selectedCount, slicerItemsVisible, …). |
 | `pbi_read_cards` | `connected:` | — | Parsed cards `[{title, value}]`. |
@@ -167,14 +169,32 @@ flag wasn't passed).
 | `pbi_visuals` | `connected:` | — | List visible visuals as `[{title, type, x, y, width, height, hasError}]` (type is a class-token heuristic; coordinates rounded). Read-only. |
 | `pbi_read_dax_editor` | `ok:` | — | Read the DAX query view editor text (Monaco; reaches the `daxQueryView` CDP target). `{ok:false, reason}` if that view isn't open. Read-only. |
 | `pbi_read_tmdl` | `ok:` | — | Read the TMDL view editor text (Monaco; reaches the `tmdlView` CDP target). `{ok:false, reason}` if that view isn't open. Read-only. |
-| `pbi_dax_query` | `ok:` | `dax`, `timeoutMs?` | Write DAX into the query view + run (F5, Run-button fallback) + read the results grid. **OVERWRITES the editor content — prior text is NOT restored (unrecoverable); use a throwaway query view.** |
+| `pbi_dax_query` | `ok:` | `dax`, `timeoutMs?`, `restore?` | Write DAX into the query view + run (F5, Run-button fallback) + read the results grid. **OVERWRITES the editor content** — but the prior text is captured first; `restore:true` re-instates it after reading (also recoverable via `pbi_editor_buffer {action:"restore"}`). |
 | `pbi_dialog` | `ok:` | `action:read\|click`, `button?` | Read/click a Desktop dialog (`desktopDialogHost` target, exists only while a dialog shows). Refuses to click Save unless `button` is exactly `"Save"`. |
 | `pbi_deep_snapshot` | `connected:` | `what:axtree\|dom\|heap`, `maxNodes?` | Raw-CDP deep inspection: compact a11y tree, DOMSnapshot size probe, or V8 heap usage. Read-only. |
 | `pbi_emulate_theme` | `connected:` | `scheme:light\|dark\|no-preference` | Forces `prefers-color-scheme` on the WebView. **INERT for PBI report canvases** (verified 2026-07-15): the media query flips but Desktop does not restyle — report theming is theme.json + app settings, not this CSS signal. Kept for completeness; reset when done. |
 | `pbi_save` | `ok:` | `confirm?` | **GUARDED save.** Without `confirm:true` → refuses (`{saved:false, reason}`), does nothing. With `confirm:true` → trusted Ctrl+S, handles the first-save "Save" dialog, verifies via lastSaved change / dirty clear. Deselect/restore BEFORE saving. |
 | `pbi_close` | `ok:` | `discardChanges?` | **GUARDED process kill — always needs `discardChanges:true`** (dirty state is undetectable over CDP; see note below). Save via `pbi_save {confirm:true}` first to keep changes. With the flag: discovers the PBIDesktop PID owning the CDP port and taskkills the tree (`/T` ends msmdsrv + WebView2 too), then resets the CDP connection. This TERMINATES Desktop — not a detach. |
-| `pbi_reload` | `ok:` | `saveFirst?`, `discardChanges?`, `waitReadyMs?` | **GUARDED visual repaint — needs `saveFirst:true` OR `discardChanges:true`** (dirty state is undetectable over CDP). `saveFirst` saves (and aborts on unverified save). Mechanism: re-navigates the current page (neighbour-and-back) so Desktop re-queries the visuals **from the loaded model** — it does **not** press Refresh and does **not** reload data from the sources (no database hit); re-nav clears transient selection. A data refresh from sources, or a full file-reopen for TMDL/TOM schema edits, is out of scope — drive those yourself. |
+| `pbi_reload` | `ok:` | `saveFirst?`, `discardChanges?`, `waitReadyMs?`, `stable?` | **GUARDED visual repaint — needs `saveFirst:true` OR `discardChanges:true`** (dirty state is undetectable over CDP). `saveFirst` saves (and aborts on unverified save). Mechanism: re-navigates the current page (neighbour-and-back) so Desktop re-queries the visuals **from the loaded model** — it does **not** press Refresh and does **not** reload data from the sources (no database hit); re-nav clears transient selection. A data refresh from sources, or a full file-reopen for TMDL/TOM schema edits, is out of scope — drive those yourself. |
 | `pbi_health` | `connected:` | `heap?` | CHEAP aggregate: `{activePage, canvasReady, visibleVisualCount, brokenVisualCount, consoleErrorCount, dirty, heapUsedMB?}`. The loop's "is everything OK?" probe. `heapUsedMB` only when `heap:true`. **`dirty` is always `null`** — see the dirty-state note below. |
+| `pbi_model_info` | `ok:` | `object`, `table?`, `nameLike?`, `top?`, `includeExpression?` | List measures/tables/columns/relationships as structured metadata via `INFO.VIEW.*` DAX (NO XMLA connection). Requires the DAX query view open in Desktop. Heavy Expression columns dropped unless `includeExpression:true`; auto-captures + restores the prior editor buffer. |
+| `pbi_dax_batch` | `ok:` | `queries[]`, `restore?` | Run up to 20 DAX queries sequentially, collect all result sets. Auto-restores the editor buffer (default `restore:true`). |
+| `pbi_format_dax` | `ok:` | — | Format the DAX query editor via Monaco `editor.action.formatDocument`; returns the reformatted text. |
+| `pbi_editor_buffer` | `ok:` | `action:capture\|restore`, `target:dax\|tmdl?` | Capture/restore the Monaco editor text so `dax_query`/`model_info` don't lose the user's query (`target` default `dax`). |
+| `pbi_wait_stable` | `connected:` | `timeoutMs?`, `quietTicks?` | Wait until the canvas render is STABLE (`Performance.getMetrics` LayoutCount/RecalcStyleCount flat + aria-busy clear). Deterministic render-done vs fixed timeouts. |
+| `pbi_read_table` | `connected:` | `titleMatch?`, `index?` | Read a `tableEx` (flat, non-matrix) grid fully as `{columns, rows}` (scrolls + merges virtualized rows). Use `pbi_read_matrix` for matrices/pivots. |
+| `pbi_show_as_table` | `connected:` | `visualTitle`, `timeoutMs?` | Best-effort: extract a visual's data via right-click data point → "Show as a table". SCOPE: needs a DOM data point — many chart/canvas visuals expose none (returns `not-extractable`). Prefer `read_matrix`/`read_table` for tabular data. |
+| `pbi_read_slicer` | `connected:` | `container?` | Read a slicer's `kind` + `selected` + `available` values (button/list); `container` scopes by title. |
+| `pbi_read_filters` | `connected:` | — | Best-effort read of the Filters pane as data; opens the pane if closed, reads, then restores it. Honest `not-ready` when empty/unparseable. |
+| `pbi_expand_all` | `connected:` | `titleMatch?`, `collapse?`, `maxClicks?` | Expand/collapse ALL matrix hierarchy levels by iteratively left-clicking the +/- expander buttons; returns `rowsBefore/After`, `clicks`, `changed`. |
+| `pbi_sort_column` | `connected:` | `column`, `titleMatch?` | Sort a grid by a column header; returns `aria-sort` before/after. |
+| `pbi_multiselect_slicer` | `connected:` | `values[]` | Multi-select list-slicer items (first plain, rest Ctrl+click); returns `clicked`/`notFound`/`selectedCount`. Mutates a filter — restore after. |
+| `pbi_drill` | `connected:` | `action:down\|up\|through`, `visualTitle?`, `dataPoint?`, `target?` | Drill down/up via the visual-header control, or drill-through via a data-point menu. Honest `not-found`/`not-extractable` when a control/point is absent. |
+| `pbi_keyboard_nav` | `connected:` | `maxStops?` | Trusted-Tab focus-order / a11y audit; records `role`+`name`+`inCanvas` per stop, detects when focus leaves the canvas. Read-only. |
+| `pbi_page_digest` | `connected:` | — | ONE-call page judgment: visuals+cards+badges+slicers+broken-visuals+console-errors in a single round-trip. The agentic loop's observe step. |
+| `pbi_diff_state` | `connected:` | `action:capture\|compare\|list`, `name?` | Capture a full page digest and structurally diff two states (cards changed/added/removed, visual/broken deltas, slicer/page changes). |
+| `pbi_assert` | `connected:` | `cardEquals?`, `visualCountAtLeast?`, `noBrokenVisuals?`, `activePageIs?` | Structured pass/fail assertions over a fresh page digest for loop control; each provided predicate becomes a `{name, passed, actual, expected}` check. |
+| `pbi_annotate_screenshot` | `connected:` | `filename?` | Screenshot with numbered overlay boxes over each visual + a legend (`n → {title, type, hasError}`) for multimodal judging; overlays always removed afterwards. |
 
 > **Dirty state is not detectable over CDP.** Verified against Desktop 2.155: a real
 > report edit changes nothing reachable from any WebView target (no title-bar change, no
@@ -190,32 +210,99 @@ A loop should poll the **CHEAP** tools; call **HEAVY** tools only intentionally.
 
 | Tier | Latency (warm) | Tools |
 |---|---|---|
-| **CHEAP** | sub-second | `pbi_status {light}`, `pbi_pages`, `pbi_state_probe`, `pbi_read_cards`, `pbi_scan_errors`, `pbi_visuals`, `pbi_health`, `pbi_snapshot`, `pbi_deep_snapshot` (heap), `pbi_read_dax_editor`, `pbi_read_tmdl`, `pbi_dialog` (read), `pbi_wait_for` (warm) |
-| **MEDIUM** | ~1-5s (click + poll) | `pbi_click`, `pbi_set_slicer`, `pbi_goto_page`, `pbi_deselect`, `pbi_hover_tooltip`, `pbi_context_menu`, `pbi_fire_bookmark`, `pbi_read_matrix`, `pbi_matrix_expand`, `pbi_search_slicer`, `pbi_type`, `pbi_screenshot`, `pbi_dax_query`, `pbi_save`, `pbi_reload` |
-| **HEAVY** | ~10-45s+ (deliberate) | `pbi_perf_analyzer`, `pbi_page_sweep`, `pbi_cross_filter_test` (repaints), `pbi_baseline` (`pages:["*"]` = all pages), `pbi_close` (process kill), `pbi_launch` |
+| **CHEAP** | sub-second | `pbi_status {light}`, `pbi_pages`, `pbi_state_probe`, `pbi_read_cards`, `pbi_scan_errors`, `pbi_visuals`, `pbi_health`, `pbi_snapshot`, `pbi_deep_snapshot` (heap), `pbi_read_dax_editor`, `pbi_read_tmdl`, `pbi_dialog` (read), `pbi_wait_for` (warm), `pbi_page_digest`, `pbi_wait_stable`, `pbi_read_slicer`, `pbi_assert`, `pbi_editor_buffer` (capture/restore) |
+| **MEDIUM** | ~1-5s (click + poll) | `pbi_click`, `pbi_set_slicer`, `pbi_goto_page`, `pbi_deselect`, `pbi_hover_tooltip`, `pbi_context_menu`, `pbi_fire_bookmark`, `pbi_read_matrix`, `pbi_matrix_expand`, `pbi_search_slicer`, `pbi_type`, `pbi_screenshot`, `pbi_dax_query`, `pbi_save`, `pbi_reload`, `pbi_model_info`, `pbi_dax_batch`, `pbi_format_dax`, `pbi_read_table`, `pbi_sort_column`, `pbi_multiselect_slicer`, `pbi_drill`, `pbi_expand_all`, `pbi_diff_state`, `pbi_annotate_screenshot`, `pbi_read_filters`, `pbi_keyboard_nav` |
+| **HEAVY** | ~10-45s+ (deliberate) | `pbi_perf_analyzer`, `pbi_page_sweep`, `pbi_cross_filter_test` (repaints), `pbi_baseline` (`pages:["*"]` = all pages), `pbi_close` (process kill), `pbi_launch`, `pbi_show_as_table` (context-menu + view switch + restore) |
 
-## Agentic loop
+## Model & DAX introspection
 
-The canonical **safe** act → observe → judge loop. Every state-changing step is behind an
-explicit guard flag — the loop only passes `confirm` / `saveFirst` / `discardChanges` when
-the edit is legitimate, so a test-click loop can never persist garbage or lose work.
+`pbi_model_info` gives you a **metadata browser** — measures, tables, columns, and
+relationships as structured rows — with **no XMLA connection**. It runs `INFO.VIEW.*` DAX
+(`INFO.VIEW.MEASURES/TABLES/COLUMNS/RELATIONSHIPS()`) inside the DAX query view and shapes
+the result grid, so you read the model over the same CDP channel as everything else.
+
+- **Precondition:** the **DAX query view must be OPEN** in Desktop (the Home ribbon's
+  "DAX query view" tab). These tools reach the separate `daxQueryView` CDP target and
+  **will not open ribbon views for you** — same precondition as `pbi_read_dax_editor`.
+- Filter with `table` (exact `[Table]`), `nameLike` (`CONTAINSSTRING` on `[Name]`), and
+  `top`. The heavy `Expression` / `FormatStringDefinition` / `DetailRowsDefinition`
+  columns are dropped by default; pass `includeExpression:true` to keep them.
+- `pbi_dax_batch` runs up to 20 queries in one call; `pbi_format_dax` pretty-prints the
+  editor via Monaco's Format Document action.
+- **Editor safety.** `pbi_dax_query` / `pbi_model_info` / `pbi_dax_batch` **overwrite** the
+  query editor, so they **capture the prior text first** and restore it (`restore:true` on
+  `dax_query`, on by default for `dax_batch`, always for `model_info`). You can also snapshot
+  and re-instate the buffer manually with `pbi_editor_buffer {action:"capture"|"restore"}`.
+
+## Reading visual data
+
+**Grids expose their full data in the DOM; charts do not.** This asymmetry is the single
+most important thing to know when reading values:
+
+- **Matrices & tables** (`pbi_read_matrix`, `pbi_read_table`) return the **complete** grid —
+  every cell is a real DOM node, and both tools scroll virtualized grids and merge the rows.
+  This is the reliable path for any tabular data.
+- **Chart values are NOT in the DOM.** Verified against Desktop 2.155: donut/column/line
+  visuals render their marks **without persistent DOM values** — arcs aren't addressable
+  SVG paths, and the `role="option"` nodes carry `aria-label="null"` (only category labels
+  are present as text). Scraping a chart's values from the DOM does not work.
+- `pbi_show_as_table` is a **best-effort** extra path: it right-clicks a data point →
+  "Show as a table" (or the `Alt+Shift+F11` accessible show-data table), reads the overlay
+  grid, and restores the canvas. It only works where the visual exposes a DOM **data point**
+  — many chart/canvas/custom visuals expose none, so it honestly returns
+  `{extracted:false, code:"not-extractable"}`. Prefer `read_matrix` / `read_table` for
+  tabular data; reach for `show_as_table` only when the data lives behind a chart.
+
+## Agentic loop v2
+
+The canonical **safe** act → observe → judge → verify loop. Every state-changing step is
+behind an explicit guard flag — the loop only passes `confirm` / `saveFirst` /
+`discardChanges` when the edit is legitimate, so a test-click loop can never persist garbage
+or lose work. The v1.2.0 tools collapse the observe/judge/verify steps into single
+round-trips:
+
+- **settle** — `pbi_wait_stable` blocks until the render is actually done (LayoutCount /
+  RecalcStyleCount flat + aria-busy clear), instead of guessing at a fixed timeout.
+- **observe** — `pbi_page_digest` returns visuals + cards + badges + slicers + broken
+  visuals + console errors in ONE call.
+- **judge** — `pbi_assert` runs structured predicates (`cardEquals`, `visualCountAtLeast`,
+  `noBrokenVisuals`, `activePageIs`) over a fresh digest and returns pass/fail.
+- **verify change** — `pbi_diff_state` captures a digest before an action and structurally
+  diffs it after (which cards changed, visual/broken deltas, slicer/page changes).
 
 ```
 pbi_launch → pbi_wait_for
+  → pbi_diff_state {action:"capture", name:"before"}   # snapshot the page digest
   → (edit via your model/authoring MCP)
-  → pbi_reload {saveFirst:true}          # repaint visuals from the loaded model (guarded; no data refresh)
-  → pbi_health                            # cheap: broken visuals? console errors? (dirty is always null — undetectable)
-  → pbi_read_cards / pbi_read_matrix / pbi_screenshot
+  → pbi_reload {saveFirst:true, stable:true}           # repaint from the loaded model + wait for settle (guarded; no data refresh)
+  → pbi_page_digest                                     # ONE-call observe: broken visuals? console errors? cards?
+  → pbi_assert {noBrokenVisuals:true, cardEquals:{...}} # judge: did it land?
+  → pbi_diff_state {action:"compare", name:"before"}    # verify: exactly what changed
   → judge → fix → repeat
   → (restore slicers/selection: pbi_deselect / CLEAR bookmark)
-  → pbi_save {confirm:true}               # opt-in save
-  → pbi_close {discardChanges:true}       # deliberate teardown at the very end (flag always required)
+  → pbi_save {confirm:true}                             # opt-in save
+  → pbi_close {discardChanges:true}                     # deliberate teardown at the very end (flag always required)
 ```
 
-Between iterations, observe with `pbi_health` and `pbi_status {light:true}` (both CHEAP).
-**Restore slicers/selection BEFORE `pbi_save {confirm:true}`** so you don't persist
-test-click state. `pbi_save`, `pbi_close`, and `pbi_reload` NEVER act without their guard
-flag — without it they return a refusal object, not the action.
+Between iterations, observe with `pbi_page_digest` / `pbi_health` and `pbi_status
+{light:true}` (all CHEAP). **Restore slicers/selection BEFORE `pbi_save {confirm:true}`** so
+you don't persist test-click state. `pbi_save`, `pbi_close`, and `pbi_reload` NEVER act
+without their guard flag — without it they return a refusal object, not the action.
+
+## Robustness
+
+Newer tools resolve elements through an **ARIA-role resolver** (role + accessible name)
+rather than brittle class selectors, so they survive Desktop DOM churn better. When a tool
+can't complete, it returns a **structured REASON `code`** instead of a bare error, so a loop
+can branch on the failure kind without string-matching:
+
+| `code` | Meaning |
+|---|---|
+| `not-found` | The target element (visual, column, slicer, matrix, drill control) wasn't present. |
+| `not-ready` | The surface exists but hasn't populated yet (e.g. an empty/collapsed Filters pane, a show-as-table grid that never appeared). |
+| `wrong-view` | The wrong CDP view is focused for the operation. |
+| `canvas-busy` | A read landed mid-render; retry after `pbi_wait_stable` / `pbi_wait_for`. |
+| `not-extractable` | The data exists but isn't reachable over the DOM (e.g. a chart with no DOM data point for `show_as_table` / drill-through). |
 
 ## Safety & etiquette
 
@@ -263,7 +350,7 @@ only detaches the CDP session, it doesn't terminate the process.
 npm test   # smoke test — passes WITHOUT Desktop running (asserts connected:false)
 ```
 
-The smoke test spawns `node server.js`, speaks MCP over stdio, asserts all 37 tools are
+The smoke test spawns `node server.js`, speaks MCP over stdio, asserts all 55 tools are
 registered (exact-count assertion), then calls `pbi_status` and asserts it returns
 `{connected:false, error, hint}` (Desktop not running). It points the CDP endpoint at a
 dead port so the connect fails fast — no Desktop required.

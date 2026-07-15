@@ -28,15 +28,15 @@ export function pageMetadata() {
   );
   const activePage = activeTabEl ? (activeTabEl.textContent || '').trim().replace(/x$/, '') : null;
 
-  // Title bar text: "R0105-Wealth Reporting· Last saved: Today at 5:09 PM (Power BI Project)".
+  // Title bar text: "My Report· Last saved: Today at 5:09 PM (Power BI Project)".
   // CRITICAL: never scan q('*') + textContent here — that is an O(n²) walk over the
   // ENTIRE report canvas (tens of thousands of nodes) that pins the WebView2 main
   // thread and freezes the report. The title lives in the app title bar, a tiny
   // scoped region. Query only known title-bar containers, and read the LEAF text
   // nodes there via a shallow, bounded scan.
   // The title-bar container's textContent is a run-on of ALL toolbar text, e.g.
-  // "SaveUndo…Redo…R0105-Wealth Reporting· Last saved: Today at 5:09 PM  (Power
-  // BI Project)Bjorn Braet…". Don't rely on element boundaries — isolate the
+  // "SaveUndo…Redo…My Report· Last saved: Today at 5:09 PM  (Power
+  // BI Project)Jane Doe…". Don't rely on element boundaries — isolate the
   // "<name>· Last saved: <…>(… Project)" window with a regex on the raw text.
   // Bounded scopes only (never a canvas-wide scan — that was the freeze).
   const hasSaved = (t) => /·\s*Last saved:/.test(t);
@@ -1844,7 +1844,7 @@ export function tagFirstRowHeader() {
  * Tag the NEXT collapsed (expand) or expanded (collapse) expand/collapse button
  * inside the tagged matrix, for iterative expand-all/collapse-all. Power BI matrix
  * hierarchy rows carry a `.expandCollapseButton` whose `aria-expanded` is "false"
- * when collapsed / "true" when expanded. A LEFT-click toggles it (verified R0105 —
+ * when collapsed / "true" when expanded. A LEFT-click toggles it (verified 2026-07-15 —
  * this is the same affordance pbi_matrix_expand uses; the row-header RIGHT-click
  * menu does NOT offer Expand/Collapse on this build). To expand-all: repeatedly tag
  * + click the first aria-expanded="false" button until none remain. Returns

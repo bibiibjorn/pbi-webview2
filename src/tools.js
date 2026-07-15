@@ -1927,7 +1927,7 @@ export function registerTools(server) {
   /* 27i. pbi_expand_all --------------------------------------------------- */
   // Expand/collapse ALL matrix hierarchy levels by iteratively LEFT-clicking the
   // per-row .expandCollapseButton affordances (the same ones pbi_matrix_expand
-  // uses), NOT the row-header right-click menu. VERIFIED (R0105, 2026-07-15): the
+  // uses), NOT the row-header right-click menu. VERIFIED (Desktop 2.155, 2026-07-15): the
   // rowheader right-click menu offers only Group/Summarize on this build — no
   // Expand/Collapse item — so the menu approach fails. Left-clicking each collapsed
   // (aria-expanded="false") button until none remain expands the whole hierarchy;
