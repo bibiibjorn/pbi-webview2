@@ -214,6 +214,17 @@ A loop should poll the **CHEAP** tools; call **HEAVY** tools only intentionally.
 | **MEDIUM** | ~1-5s (click + poll) | `pbi_click`, `pbi_set_slicer`, `pbi_goto_page`, `pbi_deselect`, `pbi_hover_tooltip`, `pbi_context_menu`, `pbi_fire_bookmark`, `pbi_read_matrix`, `pbi_matrix_expand`, `pbi_search_slicer`, `pbi_type`, `pbi_screenshot`, `pbi_dax_query`, `pbi_save`, `pbi_reload`, `pbi_model_info`, `pbi_dax_batch`, `pbi_format_dax`, `pbi_read_table`, `pbi_sort_column`, `pbi_multiselect_slicer`, `pbi_drill`, `pbi_expand_all`, `pbi_diff_state`, `pbi_annotate_screenshot`, `pbi_read_filters`, `pbi_keyboard_nav` |
 | **HEAVY** | ~10-45s+ (deliberate) | `pbi_perf_analyzer`, `pbi_page_sweep`, `pbi_cross_filter_test` (repaints), `pbi_baseline` (`pages:["*"]` = all pages), `pbi_close` (process kill), `pbi_launch`, `pbi_show_as_table` (context-menu + view switch + restore) |
 
+## Choosing between similar tools
+
+Several tools overlap in area but answer different questions — pick by intent:
+
+- **State reads:** `pbi_status` (build/title/page/zoom) · `pbi_state_probe` (toggles/cards/badges/selection — cheapest data probe) · `pbi_health` (broken/console/heap quick-check) · `pbi_page_digest` (everything in one call — supersets `state_probe`; use it as the agentic **observe** step, `state_probe` when you only need the cheap scorecard).
+- **Slicers:** `pbi_set_slicer` (one button/item) · `pbi_multiselect_slicer` (several list items, Ctrl-held) · `pbi_search_slicer` (type in the search box, optional pick). Distinct mechanics — not interchangeable.
+- **Grids:** `pbi_read_matrix` (matrix/pivot, merges row headers) · `pbi_read_table` (flat `tableEx`, no row headers). `pbi_show_as_table` is the best-effort extractor for **non-grid** visuals (and often returns `not-extractable` — see below).
+- **Waiting:** `pbi_wait_for` (a specific text appears/disappears) · `pbi_wait_stable` (render fully settles — deterministic, use after a nav/edit).
+- **Escape hatches:** `pbi_eval` (`page.evaluate`, synthetic events — read-only DOM) · `pbi_run_code` (trusted `page.mouse`/`page.keyboard` — real input).
+- **Screenshots:** `pbi_screenshot` (full page or one visual via `visualTitle`) · `pbi_annotate_screenshot` (numbered overlay boxes + legend for multimodal judging).
+
 ## Model & DAX introspection
 
 `pbi_model_info` gives you a **metadata browser** — measures, tables, columns, and
