@@ -1,5 +1,5 @@
 /**
- * Tool catalog — registers all 42 pbi-webview2 tools on the McpServer.
+ * Tool catalog — registers all 46 pbi-webview2 tools on the McpServer.
  *
  * Every tool wraps its work in withReport(fn) (lazy connect + reconnect-retry),
  * returns compact JSON via ok(), and never leaks window.powerBIAccessToken.
@@ -1659,6 +1659,262 @@ export function registerTools(server) {
             return { ok: false, reason: (res && res.reason) || 'format failed' };
           }
           return { ok: true, formatted: true, text: res.text };
+        })
+      )
+  );
+
+  /* 27e. pbi_read_table --------------------------------------------------- */
+  server.registerTool(
+    'pbi_read_table',
+    {
+      description:
+        'Read a TABLE (tableEx) visual fully as {found, columns, rows:[{cells}], ariaRowCount, ariaColCount, complete, titles, pickedTitle}. Targets the tableEx visual type (a flat table — NO row headers, unlike a matrix; use pbi_read_matrix for matrices/pivots). Scrolls virtualized grids and merges rows (deduped by cell content). Pick with titleMatch (aria-label/title contains) or index; default = the first tableEx. If none present returns {found:false, code:"not-found", reason, titles}.',
+      inputSchema: {
+        titleMatch: z.string().optional(),
+        index: z.number().int().optional(),
+      },
+    },
+    async ({ titleMatch, index }) =>
+      guard(() =>
+        withReport(async (page) => {
+          const tag = await page.evaluate(F.tagTableGrid, { titleMatch, index });
+          if (!tag.found) {
+            return {
+              connected: true,
+              found: false,
+              reason: 'no table (tableEx) visual',
+              code: REASON.NOT_FOUND,
+              titles: tag.titles,
+            };
+          }
+          let data = await page.evaluate(F.readTaggedTable);
+          // Virtualized: scroll + re-read, dedupe rows by their cell content (no
+          // row header to key on, unlike pbi_read_matrix).
+          if (!data.complete) {
+            const byKey = new Map();
+            const keyOf = (r) => JSON.stringify(r.cells);
+            for (const r of data.rows) byKey.set(keyOf(r), r);
+            let columns = data.columns;
+            for (let i = 0; i < 20 && byKey.size < (data.ariaRowCount || 0); i++) {
+              await page.evaluate(F.scrollTaggedTable, 400);
+              await new Promise((r) => setTimeout(r, 250));
+              // Re-tag (scroll may re-render) then re-read.
+              await page.evaluate(F.tagTableGrid, { titleMatch, index: tag.index });
+              const more = await page.evaluate(F.readTaggedTable);
+              if (!more.found) break;
+              for (const r of more.rows) {
+                const k = keyOf(r);
+                if (!byKey.has(k)) byKey.set(k, r);
+              }
+              if (more.rows.length && columns.length === 0) columns = more.columns;
+            }
+            data = {
+              found: true,
+              columns,
+              rows: [...byKey.values()],
+              ariaRowCount: data.ariaRowCount,
+              ariaColCount: data.ariaColCount,
+              domRows: byKey.size,
+              complete: byKey.size >= (data.ariaRowCount || 0),
+            };
+          }
+          return {
+            connected: true,
+            ...data,
+            titleIndex: tag.index,
+            pickedTitle: tag.pickedTitle,
+            titles: tag.titles,
+          };
+        })
+      )
+  );
+
+  /* 27f. pbi_show_as_table ------------------------------------------------ */
+  // UNIVERSAL extractor: chart data VALUES are NOT in the SVG DOM at rest, so the
+  // only way to read a chart's underlying data is Power BI's own "Show as a table".
+  // Right-click a DATA POINT (a [role="option"] mark — whitespace right-click only
+  // yields Group/Summarize), pick "Show as a table" (fallback Alt+Shift+F11), read
+  // the overlay grid, then RESTORE via "Back to report" (finally block).
+  server.registerTool(
+    'pbi_show_as_table',
+    {
+      description:
+        'Extract a visual\'s underlying data via Power BI\'s "Show as a table". Right-clicks a DATA POINT (a [role="option"] mark) of the visual matching visualTitle, picks "Show as a table" (fallback: Alt+Shift+F11), reads the overlay grid, then RESTORES the canvas ("Back to report"/Escape) even on failure. Returns {extracted:true, via, visualTitle, columns, rows, rowCount}. IMPORTANT SCOPE (verified 2026-07-15): this needs the visual to expose a DOM data point — MANY Power BI visuals (donut/column/line and canvas/image/custom visuals) render marks WITHOUT persistent [role="option"] nodes, so extraction returns {extracted:false, code:"not-extractable"}. For TABULAR data prefer pbi_read_matrix / pbi_read_table (grids DO expose full DOM data). Use this as a best-effort extra path, not a guaranteed universal extractor.',
+      inputSchema: {
+        visualTitle: z.string(),
+        timeoutMs: z.number().int().optional().describe('How long to poll for the show-as-table grid (default 15000)'),
+      },
+    },
+    async ({ visualTitle, timeoutMs = 15000 }) =>
+      guard(() =>
+        withReport(async (page) => {
+          // 1. Find + tag a data point in the target visual.
+          const dp = await page.evaluate(F.tagDataPoint, visualTitle);
+          if (!dp.found) {
+            return {
+              connected: true,
+              extracted: false,
+              code: REASON.NOT_EXTRACTABLE,
+              reason: dp.reason,
+              candidates: dp.candidates,
+            };
+          }
+
+          let via = null;
+          // 2. Right-click the data point (trusted on-path click) and poll for a menu.
+          const pt = await page.evaluate(F.clickPointForSelector, { selector: dp.selector });
+          if (pt && pt.found) {
+            await page.mouse.click(pt.x, pt.y, { button: 'right' });
+            const menu = await poll(
+              () => page.evaluate(F.readMenuItems),
+              (v) => v && v.menuOpen && v.items.length > 0,
+              3000
+            );
+            // 3. Look for a "Show as a table" item.
+            if (menu.satisfied) {
+              const mi = await page.evaluate(F.tagMenuItem, 'Show as a table');
+              if (mi.found) {
+                await robustClick(page, mi.selector, false);
+                via = 'context-menu';
+              } else {
+                // 3b. No such item — dismiss the menu and fall through to the fallback.
+                await page.keyboard.press('Escape');
+                await page.evaluate(() => 1);
+              }
+            }
+          }
+
+          // 3b. FALLBACK: accessible show-data via Alt+Shift+F11. Focus the visual
+          // by clicking its CENTER (tagVisualByTitle rect — NOT a right-click).
+          if (!via) {
+            const vis = await page.evaluate(F.tagVisualByTitle, visualTitle);
+            if (vis.found) {
+              await page.mouse.click(vis.x + vis.width / 2, vis.y + vis.height / 2);
+              await page.keyboard.press('Alt+Shift+F11');
+              via = 'alt-shift-f11';
+            }
+          }
+
+          // 4/5. Poll for the grid, read it, then ALWAYS restore.
+          try {
+            const gridPoll = await poll(
+              () => page.evaluate(F.readShowAsTableGrid),
+              (v) => v && v.found && v.rows.length > 0,
+              timeoutMs
+            );
+            const g = gridPoll.value;
+            if (!g || !g.found || !g.rows.length) {
+              return {
+                connected: true,
+                extracted: false,
+                code: REASON.NOT_READY,
+                reason: 'show-as-table grid did not appear',
+                via,
+              };
+            }
+            return {
+              connected: true,
+              extracted: true,
+              via,
+              visualTitle: dp.matchedTitle || visualTitle,
+              columns: g.columns,
+              rows: g.rows,
+              rowCount: g.rowCount,
+            };
+          } finally {
+            // RESTORE: click "Back to report" if present, else press Escape.
+            try {
+              const back = await page.evaluate(F.tagBackToReport);
+              if (back.found) {
+                await robustClick(page, back.selector, false);
+              } else {
+                await page.keyboard.press('Escape');
+              }
+            } catch (e) { /* best-effort restore */ }
+          }
+        })
+      )
+  );
+
+  /* 27g. pbi_read_slicer -------------------------------------------------- */
+  server.registerTool(
+    'pbi_read_slicer',
+    {
+      description:
+        'Read a slicer\'s state: {connected:true, found, kind:"button"|"list", selected:[...], available:[...], hasSearch, itemCount}. Button slicers report aria-pressed items; list slicers report aria-selected / checked items. Optional container scopes to the slicer whose title/aria-label contains the string; default = the first slicer found. If none → {connected:true, found:false, code:"not-found", reason}.',
+      inputSchema: {
+        container: z.string().optional(),
+      },
+    },
+    async ({ container }) =>
+      guard(() =>
+        withReport(async (page) => {
+          const state = await page.evaluate(F.readSlicerState, { container });
+          if (!state.found) {
+            return { connected: true, found: false, code: REASON.NOT_FOUND, reason: 'no slicer found' };
+          }
+          return { connected: true, ...state };
+        })
+      )
+  );
+
+  /* 27h. pbi_read_filters ------------------------------------------------- */
+  // Best-effort: filter-card DOM only populates when the Filters pane is OPEN. If
+  // closed, open it via the View ribbon → Filters (same pattern as fire_bookmark),
+  // read, then RESTORE (close it again + return to Home) in a finally block.
+  server.registerTool(
+    'pbi_read_filters',
+    {
+      description:
+        'Read the Filters pane as data (best-effort): {connected:true, filters:[{field, scope, condition, values, isLocked, isHidden}], paneWasOpened}. Filter-card DOM only populates when the pane is OPEN, so if it is closed this opens it via View → Filters, reads, then RESTORES (closes it if we opened it, returns to Home). Unknown card details come back as nulls. If cards are empty/unparseable → {connected:true, filters:[], code:"not-ready", reason}.',
+      inputSchema: {},
+    },
+    async () =>
+      guard(() =>
+        withReport(async (page) => {
+          let paneWasOpened = false;
+          const alreadyOpen = await page.evaluate(F.filterPaneOpen);
+          if (!alreadyOpen) {
+            // Open via View ribbon → Filters (same chain as pbi_fire_bookmark).
+            const view = await page.evaluate(F.tagRibbonTab, 'View');
+            if (view.found) {
+              await robustClick(page, view.selector, false);
+              await new Promise((r) => setTimeout(r, 400));
+            }
+            const btn = await page.evaluate(F.tagRibbonButton, 'Filters');
+            if (btn.found) {
+              await robustClick(page, btn.selector, false);
+              await poll(() => page.evaluate(F.filterPaneOpen), (v) => v === true, 4000);
+              paneWasOpened = true;
+            }
+          }
+
+          const restoreChrome = async () => {
+            try {
+              if (paneWasOpened) {
+                const btnClose = await page.evaluate(F.tagRibbonButton, 'Filters');
+                if (btnClose.found) await robustClick(page, btnClose.selector, false);
+              }
+              const home = await page.evaluate(F.tagRibbonTab, 'Home');
+              if (home.found) await robustClick(page, home.selector, false);
+            } catch (e) { /* best-effort restore */ }
+          };
+
+          try {
+            const filters = await page.evaluate(F.readFilterCards);
+            if (!filters || !filters.length) {
+              return {
+                connected: true,
+                filters: [],
+                paneWasOpened,
+                code: REASON.NOT_READY,
+                reason: 'filter pane empty or unparseable',
+              };
+            }
+            return { connected: true, filters, paneWasOpened };
+          } finally {
+            await restoreChrome();
+          }
         })
       )
   );

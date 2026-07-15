@@ -1396,3 +1396,385 @@ export function tagDialogButton(label) {
   el.setAttribute('data-pw', 'pw-dialogbtn');
   return { found: true, selector: '[data-pw="pw-dialogbtn"]', matchedLabel: labelOf(el), buttons: all };
 }
+
+/* ----------------------------------------------------------------- tableEx */
+
+/**
+ * Tag a table (tableEx) visual's grid and report its visible titles. UNLIKE
+ * tagMatrix (which targets any [role="grid"] and is used for matrices/pivots),
+ * this is scoped to the tableEx visual type (`[class*="visual-tableEx"]`, NOT
+ * pivotTable) — a flat table has columns but no row headers. Pick order:
+ * titleMatch (aria-label/title contains, case-insensitive) > index > first
+ * tableEx. Tags the picked container's [role="grid"] with `pw-table`. Returns
+ * {found, selector, index, titles, pickedTitle}.
+ */
+export function tagTableGrid(arg) {
+  const { titleMatch, index } = arg || {};
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  const containers = q('.visualContainer').filter((c) => {
+    const r = c.getBoundingClientRect();
+    if (!(r.width > 0 && r.height > 0)) return false;
+    // tableEx host token on a descendant (or the container itself). Exclude
+    // pivotTable — that is a matrix, handled by tagMatrix/pbi_read_matrix.
+    const cls = (el) => ((el.className || '').toString());
+    if (/visual-tableEx/.test(cls(c))) return !!c.querySelector('[role="grid"]');
+    const host = c.querySelector('[class*="visual-tableEx"]');
+    return !!host && !!c.querySelector('[role="grid"]');
+  });
+  const gridOf = (c) => c.querySelector('[role="grid"]');
+  const titleOf = (c) => {
+    const g = gridOf(c);
+    return (
+      (g && (g.getAttribute('aria-label') || '').trim()) ||
+      (c.getAttribute('aria-label') || '').trim() ||
+      ((c.querySelector('.visualTitle') && (c.querySelector('.visualTitle').textContent || '').trim())) ||
+      ''
+    );
+  };
+  const titles = containers.map(titleOf);
+  let picked = -1;
+  if (titleMatch) {
+    picked = containers.findIndex((c) => titleOf(c).toLowerCase().includes(titleMatch.toLowerCase()));
+  } else if (index != null) {
+    picked = Math.min(index, containers.length - 1);
+  } else {
+    picked = containers.length ? 0 : -1;
+  }
+  if (picked < 0 || !containers[picked]) return { found: false, selector: null, titles };
+  const grid = gridOf(containers[picked]);
+  document.querySelectorAll('[data-pw="pw-table"]').forEach(function (e) { e.removeAttribute('data-pw'); });
+  grid.setAttribute('data-pw', 'pw-table');
+  return {
+    found: true,
+    selector: '[data-pw="pw-table"]',
+    index: picked,
+    titles,
+    pickedTitle: titleOf(containers[picked]),
+  };
+}
+
+/**
+ * Read the tagged table grid ('[data-pw="pw-table"]') fully as JSON. Tables have
+ * NO row headers (unlike readTaggedMatrix): columns come from the first row's
+ * [role="columnheader"] cells, and each data [role="row"] yields a FLAT cells
+ * array of its [role="gridcell"] texts (no header field). Returns
+ * {found, columns, rows:[{cells}], ariaRowCount, ariaColCount, domRows, complete}.
+ */
+export function readTaggedTable() {
+  const grid = document.querySelector('[data-pw="pw-table"]');
+  if (!grid) return { found: false };
+  const q = (root, s) => Array.from(root.querySelectorAll(s));
+  const ariaRowCount = parseInt(grid.getAttribute('aria-rowcount') || '0', 10) || null;
+  const ariaColCount = parseInt(grid.getAttribute('aria-colcount') || '0', 10) || null;
+  const rowEls = q(grid, '[role="row"]');
+  const columns = [];
+  const rows = [];
+  for (const r of rowEls) {
+    const headerCells = q(r, '[role="columnheader"]');
+    // A header row (holds columnheaders) defines the columns once.
+    if (headerCells.length && !columns.length) {
+      for (const c of headerCells) columns.push((c.textContent || '').trim());
+      continue;
+    }
+    const cellEls = q(r, '[role="gridcell"]');
+    if (!cellEls.length) continue;
+    rows.push({ cells: cellEls.map((c) => (c.textContent || '').trim()) });
+  }
+  const domRows = rows.length;
+  const complete = !ariaRowCount || rowEls.length >= ariaRowCount;
+  return { found: true, columns, rows, ariaRowCount, ariaColCount, domRows, complete };
+}
+
+/** Scroll the tagged table by dy (px) to reveal virtualized rows (mirrors scrollTaggedMatrix). */
+export function scrollTaggedTable(dy) {
+  const grid = document.querySelector('[data-pw="pw-table"]');
+  if (!grid) return { scrolled: false };
+  let node = grid;
+  for (let i = 0; i < 4 && node; i++) {
+    if (node.scrollHeight > node.clientHeight + 2) {
+      node.scrollTop = node.scrollTop + dy;
+      return { scrolled: true, scrollTop: node.scrollTop };
+    }
+    node = node.parentElement;
+  }
+  grid.scrollTop = (grid.scrollTop || 0) + dy;
+  return { scrolled: true, scrollTop: grid.scrollTop };
+}
+
+/* ------------------------------------------------------- show-as-table */
+
+/**
+ * Tag the FIRST data-point mark inside the visual whose title matches
+ * `visualTitle` (same title logic as tagVisualByTitle, inlined per the
+ * self-contained page-fn rule). A data point is a `[role="option"]` mark (donut
+ * arc, column rect, matrix cell, …). Tags it `data-pw="pw-dp"`. On a hit returns
+ * {found:true, selector, pointCount, matchedTitle}; if the visual matched but has
+ * NO role=option marks (canvas/image/custom visual) returns
+ * {found:false, reason, candidates:[titles]}; if no visual matched returns
+ * {found:false, reason:'visual not found', candidates:[titles]}.
+ */
+export function tagDataPoint(visualTitle) {
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  const titleOf = (c) => {
+    const own = (c.getAttribute('aria-label') || '').trim();
+    if (own) return own;
+    const desc = c.querySelector('[aria-label]');
+    if (desc && (desc.getAttribute('aria-label') || '').trim()) return (desc.getAttribute('aria-label') || '').trim();
+    const t = c.querySelector('.visualTitle');
+    if (t && (t.textContent || '').trim()) return (t.textContent || '').trim();
+    return null;
+  };
+  const visible = q('.visualContainer').filter((c) => {
+    const r = c.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  });
+  const withTitle = visible.map((c) => ({ el: c, title: titleOf(c) })).filter((o) => o.title);
+  const lc = (visualTitle || '').toLowerCase();
+  let hit = withTitle.find((o) => o.title === visualTitle);
+  if (!hit) hit = withTitle.find((o) => o.title.toLowerCase().includes(lc));
+  if (!hit) {
+    return { found: false, reason: 'visual not found', candidates: withTitle.map((o) => o.title) };
+  }
+  const marks = Array.from(hit.el.querySelectorAll('[role="option"]')).filter((el) => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  });
+  if (!marks.length) {
+    return {
+      found: false,
+      reason: 'no data point (canvas/image/custom visual?)',
+      matchedTitle: hit.title,
+      candidates: withTitle.map((o) => o.title),
+    };
+  }
+  const dp = marks[0];
+  document.querySelectorAll('[data-pw="pw-dp"]').forEach(function (e) { e.removeAttribute('data-pw'); });
+  dp.setAttribute('data-pw', 'pw-dp');
+  return { found: true, selector: '[data-pw="pw-dp"]', pointCount: marks.length, matchedTitle: hit.title };
+}
+
+/**
+ * Read the Show-data ("Show as a table") overlay grid. That view renders a visible
+ * [role="grid"] (often a full-width overlay) — pick the LARGEST visible one and read
+ * its columns ([role="columnheader"], else the first row's cells) + rows
+ * ([role="row"] > [role="gridcell"]). Returns {found, columns, rows, rowCount}.
+ */
+export function readShowAsTableGrid() {
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  const grids = q('[role="grid"]').filter((g) => {
+    const r = g.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  });
+  if (!grids.length) return { found: false, columns: [], rows: [], rowCount: 0 };
+  // Largest visible grid by area.
+  let grid = grids[0];
+  let bestArea = -1;
+  for (const g of grids) {
+    const r = g.getBoundingClientRect();
+    const area = r.width * r.height;
+    if (area > bestArea) { bestArea = area; grid = g; }
+  }
+  const rowEls = Array.from(grid.querySelectorAll('[role="row"]'));
+  let columns = Array.from(grid.querySelectorAll('[role="columnheader"]')).map((c) => (c.textContent || '').trim());
+  const rows = [];
+  for (const r of rowEls) {
+    if (r.querySelector('[role="columnheader"]')) {
+      // A header row: adopt as columns if we have none yet, then skip it.
+      if (!columns.length) {
+        columns = Array.from(r.querySelectorAll('[role="columnheader"]')).map((c) => (c.textContent || '').trim());
+      }
+      continue;
+    }
+    const cells = Array.from(r.querySelectorAll('[role="gridcell"]')).map((c) => (c.textContent || '').trim());
+    if (cells.length) rows.push(cells);
+  }
+  return { found: rows.length > 0 || columns.length > 0, columns, rows: rows.slice(0, 500), rowCount: rows.length };
+}
+
+/**
+ * Find + tag the "Back to report" control that dismisses the Show-data overlay.
+ * Matches a visible button/[role=button]/[role=menuitem] whose aria-label or text
+ * matches /back to report/i. Tags it `data-pw="pw-back"`. Returns {found, selector}.
+ */
+export function tagBackToReport() {
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  const isVisible = (el) => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const re = /back to report/i;
+  const labelOf = (el) => ((el.getAttribute('aria-label') || '') || (el.textContent || '')).trim();
+  const el = q('button, [role="button"], [role="menuitem"]')
+    .filter(isVisible)
+    .find((b) => re.test(labelOf(b)));
+  if (!el) return { found: false, selector: null };
+  document.querySelectorAll('[data-pw="pw-back"]').forEach(function (e) { e.removeAttribute('data-pw'); });
+  el.setAttribute('data-pw', 'pw-back');
+  return { found: true, selector: '[data-pw="pw-back"]' };
+}
+
+/* --------------------------------------------------------------- slicer state */
+
+/**
+ * Read a slicer's full state (selections + available values). Locate slicer
+ * host(s) (.slicer / .slicerContainer / .visualContainer), optionally filtered by
+ * `container` (its title/aria-label contains the string). Detect kind:
+ *  - BUTTON slicer: buttonSlicerVisual buttons → kind='button'; each item is
+ *    {text, pressed:aria-pressed==='true'}; selected = the pressed ones.
+ *  - LIST slicer: .slicerItemContainer items → kind='list'; each item
+ *    {label:(aria-label||text), selected:(aria-selected==='true' || an inner
+ *    checked checkbox)}; available = all labels, selected = the selected ones.
+ * hasSearch = a search input is present in the host. Returns
+ * {found, kind, selected:[...], available:[...], hasSearch, itemCount}.
+ */
+export function readSlicerState(arg) {
+  const { container } = arg || {};
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  const isVisible = (el) => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const labelOf = (host) =>
+    (host.getAttribute('aria-label') || '') +
+    ' ' +
+    ((host.querySelector('[aria-label]') && host.querySelector('[aria-label]').getAttribute('aria-label')) || '') +
+    ' ' +
+    ((host.querySelector('.visualTitle, .title') && host.querySelector('.visualTitle, .title').textContent) || '');
+  let hosts = q('.slicer, .slicerContainer, .visualContainer').filter(isVisible);
+  if (container) {
+    const lc = container.toLowerCase();
+    hosts = hosts.filter((h) => labelOf(h).toLowerCase().includes(lc));
+  }
+  // Pick the first host that actually looks like a slicer (has button/list items).
+  const isButtonBtn = (el) => (el.className || '').toString().includes('buttonSlicerVisual');
+  let host = null;
+  let kind = null;
+  for (const h of hosts) {
+    const btns = Array.from(h.querySelectorAll('[role="button"]')).filter(isButtonBtn);
+    if (btns.length) { host = h; kind = 'button'; break; }
+    if (h.querySelector('.slicerItemContainer')) { host = h; kind = 'list'; break; }
+  }
+  if (!host) return { found: false, kind: null, selected: [], available: [], hasSearch: false, itemCount: 0 };
+
+  const hasSearch = !!Array.from(
+    host.querySelectorAll('input.searchInput, input[type="search"], [aria-label*="Search" i], [role="searchbox"]')
+  ).find(isVisible);
+
+  if (kind === 'button') {
+    const btns = Array.from(host.querySelectorAll('[role="button"]')).filter((b) => isButtonBtn(b) && isVisible(b));
+    const items = btns.map((b) => ({
+      text: (b.textContent || '').trim(),
+      pressed: b.getAttribute('aria-pressed') === 'true',
+    }));
+    return {
+      found: true,
+      kind: 'button',
+      selected: items.filter((i) => i.pressed).map((i) => i.text),
+      available: items.map((i) => i.text),
+      hasSearch,
+      itemCount: items.length,
+    };
+  }
+
+  // list
+  const items = Array.from(host.querySelectorAll('.slicerItemContainer')).filter(isVisible);
+  const parsed = items.map((el) => {
+    const label = (el.getAttribute('aria-label') || '').trim() || (el.textContent || '').trim();
+    const ariaSel = el.getAttribute('aria-selected') === 'true';
+    const box = el.querySelector('input[type="checkbox"], [role="checkbox"]');
+    const boxChecked =
+      !!box && (box.checked === true || box.getAttribute('aria-checked') === 'true');
+    return { label, selected: ariaSel || boxChecked };
+  }).filter((o) => o.label);
+  return {
+    found: true,
+    kind: 'list',
+    selected: parsed.filter((i) => i.selected).map((i) => i.label),
+    available: parsed.map((i) => i.label),
+    hasSearch,
+    itemCount: parsed.length,
+  };
+}
+
+/* --------------------------------------------------------------- filters pane */
+
+/** Is the Filters pane open with at least one filter-card element? */
+export function filterPaneOpen() {
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  const panes = q('.filterPane').filter((el) => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  });
+  for (const p of panes) {
+    if (p.querySelector('[class*="filterCard" i], [class*="card" i][aria-label], .filterContainer > *')) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Best-effort read of the filter cards inside the Filters pane. Enumerates card
+ * containers (several candidate selectors) and returns for each:
+ *  {field, scope:'visual'|'page'|'report'|null, condition, values:[], isLocked, isHidden}.
+ * field = a card aria-label or a title element's text; scope inferred from a
+ * nearby section header when determinable, else null; condition = card text when
+ * short, else null. Unknown → nulls. Returns an array (possibly empty).
+ */
+export function readFilterCards() {
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  const isVisible = (el) => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const pane = q('.filterPane').filter(isVisible)[0];
+  if (!pane) return [];
+  // Candidate card containers, de-duplicated (a node might match >1 selector).
+  const raw = [
+    ...pane.querySelectorAll('[class*="filterCard" i]'),
+    ...pane.querySelectorAll('[class*="card" i][aria-label]'),
+    ...Array.from(pane.querySelectorAll('.filterContainer')).flatMap((fc) => Array.from(fc.children)),
+  ];
+  const seen = new Set();
+  const cards = raw.filter((el) => {
+    if (!isVisible(el)) return false;
+    if (seen.has(el)) return false;
+    seen.add(el);
+    return true;
+  });
+  // Infer scope from a preceding section header ("Filters on this visual" /
+  // "…this page" / "…all pages"). Best-effort: scan the pane text once for the
+  // presence of each header — not per-card positioning.
+  const scopeFor = (el) => {
+    let node = el;
+    for (let i = 0; i < 8 && node; i++) {
+      // Look for a heading sibling above this card.
+      let sib = node.previousElementSibling;
+      while (sib) {
+        const t = (sib.textContent || '').trim();
+        if (/this visual/i.test(t)) return 'visual';
+        if (/this page/i.test(t)) return 'page';
+        if (/all pages/i.test(t)) return 'report';
+        sib = sib.previousElementSibling;
+      }
+      node = node.parentElement;
+    }
+    return null;
+  };
+  return cards.map((el) => {
+    const field =
+      (el.getAttribute('aria-label') || '').trim() ||
+      ((el.querySelector('[class*="title" i], .cardName, .fieldName') &&
+        (el.querySelector('[class*="title" i], .cardName, .fieldName').textContent || '').trim())) ||
+      null;
+    const txt = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    return {
+      field,
+      scope: scopeFor(el),
+      condition: txt && txt.length < 200 ? txt : null,
+      values: [],
+      isLocked: false,
+      isHidden: false,
+    };
+  });
+}
