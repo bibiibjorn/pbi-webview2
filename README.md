@@ -1,5 +1,9 @@
 # pbi-webview2 — MCP server for the live Power BI Desktop report canvas
 
+[![npm version](https://img.shields.io/npm/v/pbi-webview2)](https://www.npmjs.com/package/pbi-webview2)
+[![license: MIT](https://img.shields.io/npm/l/pbi-webview2)](LICENSE)
+![platform: Windows](https://img.shields.io/badge/platform-Windows-blue)
+
 `pbi-webview2` is a [Model Context Protocol](https://modelcontextprotocol.io) server
 that drives **Power BI Desktop's WebView2 report canvas over CDP** (Chrome DevTools
 Protocol). It turns an AI agent (Claude Code, Claude Desktop, or any MCP client) into
