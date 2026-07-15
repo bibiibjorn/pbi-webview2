@@ -1,5 +1,5 @@
 /**
- * Tool catalog — registers all 41 pbi-webview2 tools on the McpServer.
+ * Tool catalog — registers all 42 pbi-webview2 tools on the McpServer.
  *
  * Every tool wraps its work in withReport(fn) (lazy connect + reconnect-retry),
  * returns compact JSON via ok(), and never leaks window.powerBIAccessToken.
@@ -18,6 +18,7 @@ import { withReport, consoleSnapshot, reset, HINT } from './connection.js';
 import { launchDesktop, findDesktopPid, killDesktop } from './launch.js';
 import * as F from './pagefns.js';
 import { buildInfoQuery } from './model.js';
+import { waitStable } from './render.js';
 
 /**
  * Captured Monaco editor text keyed by target ('dax'|'tmdl'). pbi_editor_buffer
@@ -30,6 +31,21 @@ const _editorBuffers = new Map();
 const OUTPUT_DIR =
   process.env.PBI_OUTPUT_DIR || path.join(os.tmpdir(), 'pbi-webview2-output');
 const BASELINE_DIR = path.join(OUTPUT_DIR, 'baselines');
+
+/**
+ * Structured failure reason codes — a stable machine-readable taxonomy the newer
+ * tools return in a `code` field alongside the human `reason`, so an agentic
+ * caller can branch on the failure kind without string-matching prose. Wave 2+
+ * tools use these; `resolveByRole` (pagefns) is the version-drift-resilient
+ * resolver those tools prefer over brittle CSS classes.
+ */
+const REASON = {
+  NOT_FOUND: 'not-found',
+  NOT_READY: 'not-ready',
+  WRONG_VIEW: 'wrong-view',
+  CANVAS_BUSY: 'canvas-busy',
+  NOT_EXTRACTABLE: 'not-extractable',
+};
 
 function ensureDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
@@ -263,9 +279,13 @@ export function registerTools(server) {
           .boolean()
           .optional()
           .describe('Wait (up to 30s) for the canvas to paint visuals before returning; default false'),
+        stable: z
+          .boolean()
+          .optional()
+          .describe('After the canvas paints, also wait for the render to SETTLE (waitStable) and include stableResult; default false'),
       },
     },
-    async ({ name, waitReady }) =>
+    async ({ name, waitReady, stable }) =>
       guard(() =>
         withReport(async (page) => {
           const tag = await page.evaluate(F.tagPageTab, name);
@@ -311,7 +331,7 @@ export function registerTools(server) {
             if (!alreadyStable) await new Promise((r) => setTimeout(r, settleMs));
           }
           const meta = res.value || {};
-          return {
+          const out = {
             connected: true,
             navigated: meta.activePage === name,
             activePage: meta.activePage,
@@ -319,6 +339,13 @@ export function registerTools(server) {
             visibleVisualCount: meta.visibleVisualCount,
             elapsedMs: res.elapsedMs,
           };
+          // Opt-in render-settle wait: after the canvas has painted visuals,
+          // block until LayoutCount/RecalcStyleCount go flat (waitStable). Default
+          // behaviour (stable not passed) is UNCHANGED.
+          if (stable) {
+            out.stableResult = await waitStable(page, { timeoutMs: 15000 });
+          }
+          return out;
         })
       )
   );
@@ -1928,9 +1955,13 @@ export function registerTools(server) {
           .int()
           .optional()
           .describe('How long to wait for the canvas to repaint (default 60000)'),
+        stable: z
+          .boolean()
+          .optional()
+          .describe('After the repaint, also wait for the render to SETTLE (waitStable) and include stableResult; default false'),
       },
     },
-    async ({ saveFirst, discardChanges, waitReadyMs = 60000 }) =>
+    async ({ saveFirst, discardChanges, waitReadyMs = 60000, stable }) =>
       guard(() =>
         withReport(async (page) => {
           // Dirty state is NOT detectable over CDP (native WPF shell, not the
@@ -1961,7 +1992,7 @@ export function registerTools(server) {
           // same neighbour-page-and-back trick pbi_deselect uses; it never touches
           // data sources. If there is no neighbour page to bounce off, be HONEST
           // and return reloaded:false rather than faking a repaint.
-          const startPage = (await page.evaluate(F.activePageName)) || meta.activePage || null;
+          const startPage = (await page.evaluate(F.activePageName)) || null;
           const pages = await page.evaluate(F.listPages);
           const neighbour = (pages || []).find((p) => p.name !== startPage);
           if (!startPage || !neighbour) {
@@ -1987,7 +2018,7 @@ export function registerTools(server) {
             waitReadyMs,
             1000
           );
-          return {
+          const out = {
             ok: true,
             reloaded: true,
             savedFirst: !!saveFirst,
@@ -1996,6 +2027,12 @@ export function registerTools(server) {
             canvasReady: !!(ready.value && ready.value.canvasReady),
             elapsedMs: Date.now() - t0,
           };
+          // Opt-in render-settle wait after the repaint re-nav. Default behaviour
+          // (stable not passed) is UNCHANGED.
+          if (stable) {
+            out.stableResult = await waitStable(page, { timeoutMs: 15000 });
+          }
+          return out;
         })
       )
   );
@@ -2042,6 +2079,26 @@ export function registerTools(server) {
         })
       )
   );
+
+  /* 35. pbi_wait_stable --------------------------------------------------- */
+  server.registerTool(
+    'pbi_wait_stable',
+    {
+      description:
+        "Wait until the report canvas render is STABLE (LayoutCount/RecalcStyleCount flat for N ticks + aria-busy clear), not just 'a visual appeared'. Cheap render-settle detector via Performance.getMetrics; replaces fixed-timeout guessing. Returns {stable, elapsedMs, visibleVisualCount}.",
+      inputSchema: {
+        timeoutMs: z.number().int().optional(),
+        quietTicks: z.number().int().optional(),
+      },
+    },
+    async ({ timeoutMs, quietTicks }) =>
+      guard(() =>
+        withReport(async (page) => ({
+          connected: true,
+          ...(await waitStable(page, { timeoutMs, quietTicks })),
+        }))
+      )
+  );
 }
 
-export { OUTPUT_DIR, BASELINE_DIR };
+export { OUTPUT_DIR, BASELINE_DIR, REASON };

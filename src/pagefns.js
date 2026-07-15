@@ -1303,6 +1303,55 @@ export function runMonacoFormat() {
   return a.run().then(() => ({ ok: true, text: eds[0].getModel().getValue() }));
 }
 
+/* --------------------------------------------------------- role resolver */
+
+/**
+ * Version-drift-resilient resolver: find an element by ARIA role + accessible
+ * name, tag it, and report the candidate set. Preferred over brittle CSS-class
+ * selectors by the newer tools. arg = {role, name, nameExact}.
+ *  - els = all [role="<role>"].
+ *  - accessible name = aria-label (trimmed) else textContent (trimmed).
+ *  - with name: exact match first; if none AND !nameExact, case-insensitive
+ *    CONTAINS. Without name: the first element of the role.
+ * Tags the pick `data-pw="pw-role"` (clearing any prior). Returns
+ * {found, selector, matchedName, role, candidateCount, candidates} on a hit, or
+ * {found:false, role, candidateCount, candidates} otherwise. candidates lists up
+ * to the first 12 non-empty accessible names (for near-miss reporting).
+ */
+export function resolveByRole(arg) {
+  const { role, name, nameExact } = arg || {};
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  const els = q('[role="' + role + '"]');
+  const nameOf = (el) =>
+    (el.getAttribute('aria-label') || '').trim() || (el.textContent || '').trim();
+  const candidates = els.slice(0, 12).map(nameOf).filter(Boolean);
+  let pick = null;
+  let matchedName = null;
+  if (name) {
+    pick = els.find((el) => nameOf(el) === name) || null;
+    if (!pick && !nameExact) {
+      const lc = name.toLowerCase();
+      pick = els.find((el) => nameOf(el).toLowerCase().includes(lc)) || null;
+    }
+  } else {
+    pick = els[0] || null;
+  }
+  if (!pick) {
+    return { found: false, role, candidateCount: els.length, candidates };
+  }
+  matchedName = nameOf(pick);
+  document.querySelectorAll('[data-pw="pw-role"]').forEach(function (e) { e.removeAttribute('data-pw'); });
+  pick.setAttribute('data-pw', 'pw-role');
+  return {
+    found: true,
+    selector: '[data-pw="pw-role"]',
+    matchedName,
+    role,
+    candidateCount: els.length,
+    candidates,
+  };
+}
+
 /* ---------------------------------------------------------------- dialog */
 // Runs in the desktopDialogHost page target (only exists while a dialog shows).
 
