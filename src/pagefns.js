@@ -653,6 +653,113 @@ export function scanBrokenVisuals() {
   return { brokenVisuals: hits, visibleVisualCount: visible.length };
 }
 
+/* ---------------------------------------------------------------- visuals */
+
+/**
+ * List every visible visual on the active page as
+ * [{title, type, x, y, width, height, hasError}].
+ *
+ * - type: derived by scanning descendant class names for the visual-host token.
+ *   The visual host is a div carrying "visual visual-<type>" (e.g.
+ *   "visual-barChart", "visual-slicer", "visual-card", "visual-tableEx",
+ *   "visual-pivotTable", "visual-donutChart"). We take the FIRST descendant
+ *   matching [class*="visual-"] and pull the token via /visual-([A-Za-z0-9]+)/;
+ *   null when nothing matches.
+ * - title: container's own aria-label (raw), else first descendant [aria-label],
+ *   else '.visualTitle' text, else null.
+ * - hasError: same errorSel + errRe as scanBrokenVisuals (duplicated inline —
+ *   page functions are self-contained).
+ * - coordinates: getBoundingClientRect(), Math.round-ed. Only width>0 && height>0.
+ */
+export function listVisuals() {
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  // Duplicated from scanBrokenVisuals on purpose (self-contained page fn).
+  const errRe =
+    /can.?t display this visual|couldn.?t (load|retrieve)|something went wrong|see details|error code|out of memory|Resource Governing/i;
+  const errorSel =
+    '.errorContainer, .visualError, .cardError, .warningIcon, [class*="error" i]:not([class*="errorbar" i])';
+  const typeOf = (c) => {
+    // Look at the container itself, then the first descendant carrying a
+    // visual-<type> class token. className may be an SVGAnimatedString, so
+    // coerce to string first.
+    const cls = (el) => ((el.className || '').toString());
+    const hostCls = /visual-([A-Za-z0-9]+)/.exec(cls(c));
+    if (hostCls) return hostCls[1];
+    const host = c.querySelector('[class*="visual-"]');
+    if (host) {
+      const m = /visual-([A-Za-z0-9]+)/.exec(cls(host));
+      if (m) return m[1];
+    }
+    return null;
+  };
+  const titleOf = (c) => {
+    const own = (c.getAttribute('aria-label') || '').trim();
+    if (own) return own;
+    const desc = c.querySelector('[aria-label]');
+    if (desc && (desc.getAttribute('aria-label') || '').trim()) return (desc.getAttribute('aria-label') || '').trim();
+    const t = c.querySelector('.visualTitle');
+    if (t && (t.textContent || '').trim()) return (t.textContent || '').trim();
+    return null;
+  };
+  const out = [];
+  for (const c of q('.visualContainer')) {
+    const r = c.getBoundingClientRect();
+    if (!(r.width > 0 && r.height > 0)) continue;
+    const txt = (c.textContent || '').replace('Press Enter to edit', '');
+    const hasError = !!c.querySelector(errorSel) || errRe.test(txt);
+    out.push({
+      title: titleOf(c),
+      type: typeOf(c),
+      x: Math.round(r.x),
+      y: Math.round(r.y),
+      width: Math.round(r.width),
+      height: Math.round(r.height),
+      hasError,
+    });
+  }
+  return out;
+}
+
+/**
+ * Find a visible visual whose title matches `title` (same title logic as
+ * listVisuals): EXACT match first, then case-insensitive CONTAINS. Returns
+ * {found, x, y, width, height, matchedTitle, candidates} — candidates lists ALL
+ * visible visual titles when not found (so the caller can report near-misses).
+ * Coordinates are Math.round-ed and suitable for a Playwright screenshot clip.
+ */
+export function tagVisualByTitle(title) {
+  const q = (s) => Array.from(document.querySelectorAll(s));
+  const titleOf = (c) => {
+    const own = (c.getAttribute('aria-label') || '').trim();
+    if (own) return own;
+    const desc = c.querySelector('[aria-label]');
+    if (desc && (desc.getAttribute('aria-label') || '').trim()) return (desc.getAttribute('aria-label') || '').trim();
+    const t = c.querySelector('.visualTitle');
+    if (t && (t.textContent || '').trim()) return (t.textContent || '').trim();
+    return null;
+  };
+  const visible = q('.visualContainer').filter((c) => {
+    const r = c.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  });
+  const withTitle = visible.map((c) => ({ el: c, title: titleOf(c) })).filter((o) => o.title);
+  const lc = title.toLowerCase();
+  let hit = withTitle.find((o) => o.title === title);
+  if (!hit) hit = withTitle.find((o) => o.title.toLowerCase().includes(lc));
+  if (!hit) {
+    return { found: false, candidates: withTitle.map((o) => o.title) };
+  }
+  const r = hit.el.getBoundingClientRect();
+  return {
+    found: true,
+    x: Math.round(r.x),
+    y: Math.round(r.y),
+    width: Math.round(r.width),
+    height: Math.round(r.height),
+    matchedTitle: hit.title,
+  };
+}
+
 /* -------------------------------------------------------------- perf pane */
 
 /** Tag the .performancePane control by kind: 'start'|'refresh'|'stop'|'clear'. */

@@ -1,9 +1,38 @@
 {
   "name": "pbi-webview2",
-  "version": "0.1.0",
-  "private": true,
+  "version": "1.0.0",
   "type": "module",
-  "description": "MCP server that drives Power BI Desktop's WebView2 report canvas over CDP.",
+  "description": "MCP server that drives the LIVE Power BI Desktop report canvas (WebView2) over CDP — switch pages, click slicers, fire bookmarks, read cards/matrices as data, judge cross-filters, run the Performance Analyzer, and screenshot, with no reload and no OCR.",
+  "license": "MIT",
+  "author": "Bjorn Braet",
+  "keywords": [
+    "mcp",
+    "power-bi",
+    "powerbi",
+    "power-bi-desktop",
+    "webview2",
+    "cdp",
+    "playwright",
+    "ui-testing",
+    "modelcontextprotocol"
+  ],
+  "os": [
+    "win32"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bibiibjorn/pbi-webview2.git"
+  },
+  "bugs": {
+    "url": "https://github.com/bibiibjorn/pbi-webview2/issues"
+  },
+  "homepage": "https://github.com/bibiibjorn/pbi-webview2#readme",
+  "files": [
+    "server.js",
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
   "bin": {
     "pbi-webview2": "server.js"
   },

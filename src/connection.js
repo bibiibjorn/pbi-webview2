@@ -15,8 +15,8 @@ const CONSOLE_CAP = 200;
 const DISCONNECT_RE = /Target.*closed|disconnected|browser has been closed|Session closed/i;
 
 const HINT =
-  'Launch Desktop via ~/.claude/scripts/pbi-desktop-debug.ps1 (CDP port is launch-time only); ' +
-  'health: http://127.0.0.1:9222/json/version';
+  'Launch Desktop via the pbi_launch tool (CDP port is launch-time only; attach-later impossible); ' +
+  'endpoint http://127.0.0.1:9222, never localhost; health: http://127.0.0.1:9222/json/version';
 
 let _browser = null;
 let _page = null;

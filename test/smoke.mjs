@@ -2,7 +2,7 @@
  * Smoke test — must pass WITHOUT Power BI Desktop running.
  *
  * Spawns `node server.js`, speaks MCP over stdio (via the SDK client:
- * initialize -> notifications/initialized -> tools/list), asserts all 32 tool
+ * initialize -> notifications/initialized -> tools/list), asserts all 33 tool
  * names are present, then calls pbi_status and asserts the result parses and has
  * connected:false (Desktop is not running). Exit 0 on pass, 1 on failure.
  */
@@ -41,6 +41,7 @@ const EXPECTED_TOOLS = [
   'pbi_search_slicer',
   'pbi_context_menu',
   'pbi_screenshot',
+  'pbi_visuals',
   'pbi_read_dax_editor',
   'pbi_read_tmdl',
   'pbi_dax_query',

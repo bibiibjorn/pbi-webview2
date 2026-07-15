@@ -1,5 +1,5 @@
 /**
- * Tool catalog — registers all 32 pbi-webview2 tools on the McpServer.
+ * Tool catalog — registers all 33 pbi-webview2 tools on the McpServer.
  *
  * Every tool wraps its work in withReport(fn) (lazy connect + reconnect-retry),
  * returns compact JSON via ok(), and never leaks window.powerBIAccessToken.
@@ -7,13 +7,14 @@
  */
 import { z } from 'zod';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { withReport, consoleSnapshot, HINT } from './connection.js';
 import { launchDesktop } from './launch.js';
 import * as F from './pagefns.js';
 
 const OUTPUT_DIR =
-  process.env.PBI_OUTPUT_DIR || 'C:/Users/bjorn.braet/AppData/Local/Temp/claude/pbi-webview2-output';
+  process.env.PBI_OUTPUT_DIR || path.join(os.tmpdir(), 'pbi-webview2-output');
 const BASELINE_DIR = path.join(OUTPUT_DIR, 'baselines');
 
 function ensureDir(dir) {
@@ -125,7 +126,7 @@ export function registerTools(server) {
     'pbi_launch',
     {
       description:
-        'Launch Power BI Desktop on a .pbip WITH the CDP debug port (replaces the pbi-desktop-debug.ps1 step). Injects the WebView2 remote-debugging env var into Desktop\'s own process, spawns detached, waits until the CDP port answers. If the port is already up, reports the running instance instead of launching a second one. Pre-flight warns about orphaned PBIDesktop/msmdsrv. After it returns cdpUp:true, call pbi_wait_for {text:"<page name>"} — the canvas is still rendering.',
+        'Launch Power BI Desktop on a .pbip WITH the CDP debug port. Resolves a launcher in order: PBI_DESKTOP_BRIDGE env → powerbi-desktop on PATH → direct PBIDesktop.exe (reported as launcher: bridge-env|bridge-path|direct). Injects the WebView2 remote-debugging env var into Desktop\'s own process, spawns detached, waits until the CDP port answers. If the port is already up, reports the running instance instead of launching a second one. Pre-flight warns about orphaned PBIDesktop/msmdsrv. After it returns cdpUp:true, call pbi_wait_for {text:"<page name>"} — the canvas is still rendering.',
       inputSchema: {
         pbip: z.string().describe('Absolute path to the .pbip file'),
         port: z.number().int().optional().describe('CDP port (default 9222)'),
@@ -995,7 +996,7 @@ export function registerTools(server) {
     'pbi_eval',
     {
       description:
-        'Escape hatch: evaluate a function-body or arrow-fn string in the reportView page. Rejects any code referencing powerBIAccessToken. Returns the JSON-serialized result.',
+        'Escape hatch: evaluate a function-body or arrow-fn string in the reportView page. Rejects any code referencing powerBIAccessToken. Returns the JSON-serialized result. NOTE: the powerBIAccessToken rejection is a best-effort textual guard (a regex on the code string), not a sandbox.',
       inputSchema: { js: z.string() },
     },
     async ({ js }) => {
@@ -1040,7 +1041,7 @@ export function registerTools(server) {
     'pbi_run_code',
     {
       description:
-        'TRUSTED escape hatch (browser_run_code_unsafe equivalent). Runs an async JS function with the live Playwright reportView `page` — page.mouse/page.keyboard give REAL trusted input (unlike pbi_eval, which is page.evaluate and cannot do trusted clicks/keys). Use for rediscovery + interactions the canned tools do not cover. The code string must be an async arrow/function taking (page); its return value is JSON-serialized. Rejects powerBIAccessToken. UNSAFE: arbitrary automation — mutating clicks change report state, so restore after. NOTE inside page.evaluate sandboxes setTimeout is undefined — use page.waitForTimeout(ms).',
+        'TRUSTED escape hatch (browser_run_code_unsafe equivalent). Runs an async JS function with the live Playwright reportView `page` — page.mouse/page.keyboard give REAL trusted input (unlike pbi_eval, which is page.evaluate and cannot do trusted clicks/keys). Use for rediscovery + interactions the canned tools do not cover. The code string must be an async arrow/function taking (page); its return value is JSON-serialized. Rejects powerBIAccessToken. UNSAFE: arbitrary automation — mutating clicks change report state, so restore after. The powerBIAccessToken rejection is a best-effort textual guard (a regex on the code string), not a sandbox. NOTE inside page.evaluate sandboxes setTimeout is undefined — use page.waitForTimeout(ms).',
       inputSchema: { code: z.string().describe('async (page) => { ... } — returns JSON-serializable') },
     },
     async ({ code }) => {
@@ -1088,14 +1089,20 @@ export function registerTools(server) {
           }
           let lines = (snap || '').split('\n');
           const total = lines.length;
+          // An invalid filter regex used to be silently ignored (returned all
+          // lines with no signal). Now flag it explicitly and return unfiltered.
+          let filterInvalid = false;
           if (filter) {
             let re = null;
             try { re = new RegExp(filter, 'i'); } catch (e) { re = null; }
             if (re) lines = lines.filter((l) => re.test(l));
+            else filterInvalid = true;
           }
           const truncated = lines.length > maxLines;
           if (truncated) lines = lines.slice(0, maxLines);
-          return { connected: true, totalLines: total, returnedLines: lines.length, truncated, lines };
+          const out = { connected: true, totalLines: total, returnedLines: lines.length, truncated, lines };
+          if (filterInvalid) out.filterInvalid = true;
+          return out;
         })
       )
   );
@@ -1237,20 +1244,50 @@ export function registerTools(server) {
     'pbi_screenshot',
     {
       description:
-        'Screenshot the reportView page to the output dir (never the repo). Optional filename + fullPage. Returns {path}.',
+        'Screenshot the reportView page to the output dir (never the repo). Optional filename + fullPage. With visualTitle, clips the shot to the matching visual (exact then case-insensitive contains on the same title logic as pbi_visuals) and returns {clippedTo}; on a miss returns {saved:false, reason, candidates}. Returns {path}.',
       inputSchema: {
         filename: z.string().optional(),
         fullPage: z.boolean().optional(),
+        visualTitle: z.string().optional(),
       },
     },
-    async ({ filename, fullPage }) =>
+    async ({ filename, fullPage, visualTitle }) =>
       guard(() =>
         withReport(async (page) => {
           ensureDir(OUTPUT_DIR);
           const fname = (filename || `shot-${Date.now()}.png`).replace(/[\\/]/g, '_');
           const abs = path.join(OUTPUT_DIR, fname);
+          if (visualTitle) {
+            const tag = await page.evaluate(F.tagVisualByTitle, visualTitle);
+            if (!tag.found) {
+              return { connected: true, saved: false, reason: 'visual not found', candidates: tag.candidates };
+            }
+            // Clip to the matched visual's rect (NOT fullPage).
+            await page.screenshot({
+              path: abs,
+              clip: { x: tag.x, y: tag.y, width: tag.width, height: tag.height },
+            });
+            return { connected: true, path: abs, clippedTo: tag.matchedTitle };
+          }
           await page.screenshot({ path: abs, fullPage: !!fullPage });
           return { connected: true, path: abs };
+        })
+      )
+  );
+
+  /* 24b. pbi_visuals ------------------------------------------------------ */
+  server.registerTool(
+    'pbi_visuals',
+    {
+      description:
+        'List every visible visual on the active page as [{title, type, x, y, width, height, hasError}]. type is a class-token heuristic (barChart, slicer, card, tableEx, pivotTable, donutChart, …; null when unknown); title from the container/descendant aria-label or .visualTitle; hasError reuses the broken-visual scan. Coordinates are getBoundingClientRect() rounded. Read-only.',
+      inputSchema: {},
+    },
+    async () =>
+      guard(() =>
+        withReport(async (page) => {
+          const visuals = await page.evaluate(F.listVisuals);
+          return { connected: true, visuals };
         })
       )
   );

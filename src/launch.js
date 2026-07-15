@@ -1,29 +1,84 @@
 /**
- * Launch Power BI Desktop with the WebView2 CDP debug port enabled — the
- * in-process equivalent of scripts/pbi-desktop-debug.ps1, exposed as a tool so
- * no separate PowerShell step is needed.
+ * Launch Power BI Desktop with the WebView2 CDP debug port enabled — exposed as a
+ * tool so no separate PowerShell/launcher step is needed.
  *
  * The CDP port only exists if WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS is set in
  * PBIDesktop's OWN environment BEFORE it starts. We inject it into the spawned
  * child's env, so only Desktops launched through this tool expose the port.
  */
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 
 const CDP_HOST = '127.0.0.1'; // never localhost — binds IPv4 only, localhost resolves IPv6 first
 
-// The `powerbi-desktop` CLI resolves to this Node entry (see the shim on PATH).
-const BRIDGE_CLI = path.join(
-  os.homedir(),
-  'node-v22.20.0-win-x64',
-  'node_modules',
-  '@microsoft',
-  'powerbi-desktop-bridge-cli',
-  'dist',
-  'index.js'
-);
+const BRIDGE_OPEN_ARGS = (pbip) => ['open', pbip, '--timeout', '480000'];
+
+/**
+ * Resolve HOW to launch Desktop, tried in order. Returns one of:
+ *   { kind:'bridge-env',  launcherPath, spawnCmd, spawnArgs }   — PBI_DESKTOP_BRIDGE
+ *   { kind:'bridge-path', launcherPath, spawnCmd, spawnArgs }   — powerbi-desktop on PATH
+ *   { kind:'direct',      launcherPath, spawnCmd, spawnArgs }   — PBIDesktop.exe fallback
+ *   null                                                        — nothing found
+ *
+ * The Microsoft `powerbi-desktop` bridge CLI takes `open <pbip> --timeout <ms>`.
+ * A `.js` entry must run under this Node (process.execPath); a `.cmd`/`.bat` must
+ * go through `cmd.exe /c` (Windows won't spawn a batch file directly); an `.exe`
+ * (or any other) spawns directly. The direct fallback needs no MS CLI at all — it
+ * launches PBIDesktop.exe with the `.pbip` as its single argument.
+ */
+function resolveLauncher(pbip) {
+  // Build the spawn cmd/args for a resolved bridge launcher path, honouring the
+  // .js / .cmd|.bat / other distinction. `bridge` is an absolute path.
+  const bridgeSpawn = (bridge) => {
+    const ext = path.extname(bridge).toLowerCase();
+    if (ext === '.js') {
+      return { spawnCmd: process.execPath, spawnArgs: [bridge, ...BRIDGE_OPEN_ARGS(pbip)] };
+    }
+    if (ext === '.cmd' || ext === '.bat') {
+      return { spawnCmd: 'cmd.exe', spawnArgs: ['/c', bridge, ...BRIDGE_OPEN_ARGS(pbip)] };
+    }
+    return { spawnCmd: bridge, spawnArgs: BRIDGE_OPEN_ARGS(pbip) };
+  };
+
+  // 1. Explicit bridge path from the env var.
+  const envBridge = process.env.PBI_DESKTOP_BRIDGE;
+  if (envBridge && fs.existsSync(envBridge)) {
+    return { kind: 'bridge-env', launcherPath: envBridge, ...bridgeSpawn(envBridge) };
+  }
+
+  // 2. `powerbi-desktop` on PATH — resolve via `where.exe` (first line; prefer a
+  //    .cmd match when where.exe reports several, since npm installs a .cmd shim).
+  try {
+    const w = spawnSync('where.exe', ['powerbi-desktop'], { windowsHide: true, encoding: 'utf8' });
+    if (w.status === 0 && w.stdout) {
+      const lines = w.stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      if (lines.length) {
+        const cmd = lines.find((l) => l.toLowerCase().endsWith('.cmd'));
+        const resolved = cmd || lines[0];
+        return { kind: 'bridge-path', launcherPath: resolved, ...bridgeSpawn(resolved) };
+      }
+    }
+  } catch (e) { /* where.exe unavailable — fall through to direct spawn */ }
+
+  // 3. Direct PBIDesktop.exe spawn (no MS CLI needed). Locate the exe in order:
+  //    PBI_DESKTOP_EXE env → %ProgramFiles% install → %LOCALAPPDATA% Store alias.
+  const exeCandidates = [
+    process.env.PBI_DESKTOP_EXE,
+    process.env.ProgramFiles &&
+      path.join(process.env.ProgramFiles, 'Microsoft Power BI Desktop', 'bin', 'PBIDesktop.exe'),
+    process.env.LOCALAPPDATA &&
+      path.join(process.env.LOCALAPPDATA, 'Microsoft', 'WindowsApps', 'PBIDesktop.exe'),
+  ].filter(Boolean);
+  for (const exe of exeCandidates) {
+    if (fs.existsSync(exe)) {
+      // PBIDesktop.exe opens a .pbip passed as its single positional argument.
+      return { kind: 'direct', launcherPath: exe, spawnCmd: exe, spawnArgs: [pbip] };
+    }
+  }
+
+  return null;
+}
 
 async function portUp(port, timeoutMs) {
   const start = Date.now();
@@ -108,32 +163,38 @@ export async function launchDesktop({ pbip, port = 9222, waitPortMs = 240000, sk
 
   const pre = await preflight();
 
-  if (!fs.existsSync(BRIDGE_CLI)) {
-    return { launched: false, error: `powerbi-desktop bridge CLI not found at ${BRIDGE_CLI}` };
+  // Resolve a launcher: PBI_DESKTOP_BRIDGE → powerbi-desktop on PATH → PBIDesktop.exe.
+  const launcher = resolveLauncher(pbip);
+  if (!launcher) {
+    return {
+      launched: false,
+      error:
+        'no launcher found — Microsoft powerbi-desktop bridge CLI is not on PATH / PBI_DESKTOP_BRIDGE, and no PBIDesktop.exe was located.',
+      hint: 'npm i -g @microsoft/powerbi-desktop-bridge-cli, or set PBI_DESKTOP_EXE to your PBIDesktop.exe',
+      preflight: pre,
+    };
   }
 
   // Spawn detached so Desktop outlives this tool call; inject the CDP env var
   // into the CHILD environment (the whole point — the shell env of this server
   // process is irrelevant; PBIDesktop reads it from its own launch env).
-  const child = spawn(
-    process.execPath,
-    [BRIDGE_CLI, 'open', pbip, '--timeout', '480000'],
-    {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true,
-      env: {
-        ...process.env,
-        WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port}`,
-      },
-    }
-  );
+  const child = spawn(launcher.spawnCmd, launcher.spawnArgs, {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+    env: {
+      ...process.env,
+      WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port}`,
+    },
+  });
   child.on('error', () => {});
   child.unref();
 
   const result = await portUp(port, waitPortMs);
   return {
     launched: true,
+    launcher: launcher.kind,
+    launcherPath: launcher.launcherPath,
     port,
     cdp: `http://${CDP_HOST}:${port}`,
     cdpUp: result.up,
